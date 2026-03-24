@@ -1,0 +1,34 @@
+[package]
+name = "mcp-gateway-console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Console application for the MCP gateway"
+
+[[bin]]
+name = "mcp"
+path = "src/main.rs"
+
+[features]
+default = ["self-signed"]
+self-signed = ["mcp-gateway-tls/self-signed"]
+
+[lints]
+workspace = true
+
+[dependencies]
+axum = { workspace = true }
+clap = { workspace = true }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+mcp-gateway-config = { workspace = true }
+mcp-gateway-credentials = { workspace = true }
+mcp-gateway-daemon = { workspace = true }
+mcp-gateway-output = { workspace = true }
+mcp-gateway-tls = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

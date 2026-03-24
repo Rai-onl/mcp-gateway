@@ -1,0 +1,23 @@
+[package]
+name = "mcp-gateway-sse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Legacy HTTP+SSE transport runtime for upstream MCP servers"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Pinned to reqwest 0.12 because reqwest-eventsource 0.6 is not
+# compatible with reqwest 0.13. This pulls a second copy of reqwest
+# into the binary. Upgrade when reqwest-eventsource releases a
+# 0.13-compatible version.
+reqwest = { version = "0.12", features = ["json"] }
+reqwest-eventsource = "0.6"
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = "0.1"
+tracing = { workspace = true }

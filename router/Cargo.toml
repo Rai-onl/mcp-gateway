@@ -1,0 +1,23 @@
+[package]
+name = "mcp-gateway-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Request routing — dispatches MCP requests by server name to the correct runtime"
+
+[features]
+sse = ["mcp-gateway-config/sse"]
+
+[lints]
+workspace = true
+
+[dependencies]
+mcp-gateway-bridge = { workspace = true }
+mcp-gateway-config = { workspace = true }
+mcp-gateway-proxy = { workspace = true }
+mcp-gateway-transport = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

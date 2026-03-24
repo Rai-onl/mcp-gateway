@@ -1,0 +1,50 @@
+[workspace]
+members = ["transport", "config", "bridge", "proxy", "router", "daemon", "console", "output", "credentials", "sse", "tls"]
+resolver = "3"
+exclude = ["tests/fixture"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+repository = "https://gitlab.com/rai.onl/mcp/gateway"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+axum = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+http-body-util = "0.1"
+ipnet = { version = "2.11", features = ["serde"] }
+rand = "0.9"
+rcgen = "0.13"
+reqwest = { version = "0.13", features = ["json"] }
+rustls = "0.23"
+rustls-pemfile = "2.2"
+reqwest-eventsource = "0.6"
+thiserror = "2.0"
+tokio = { version = "1.50", features = ["process", "io-util", "rt", "rt-multi-thread", "net", "macros", "signal", "time"] }
+tokio-rustls = "0.26"
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+zeroize = "1.8"
+
+# Internal workspace crates.
+mcp-gateway-credentials = { path = "credentials" }
+mcp-gateway-bridge = { path = "bridge" }
+mcp-gateway-daemon = { path = "daemon" }
+mcp-gateway-output = { path = "output" }
+mcp-gateway-proxy = { path = "proxy" }
+mcp-gateway-router = { path = "router" }
+mcp-gateway-config = { path = "config" }
+mcp-gateway-sse = { path = "sse" }
+mcp-gateway-tls = { path = "tls" }
+mcp-gateway-transport = { path = "transport" }

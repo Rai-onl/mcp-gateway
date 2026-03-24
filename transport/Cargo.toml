@@ -1,0 +1,14 @@
+[package]
+name = "mcp-gateway-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP message types and JSON-RPC 2.0 detection for the gateway"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

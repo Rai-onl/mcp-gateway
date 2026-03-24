@@ -1,0 +1,32 @@
+[package]
+name = "mcp-gateway-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP daemon — axum server exposing MCP endpoints and health checks"
+
+[features]
+sse = ["mcp-gateway-config/sse", "mcp-gateway-router/sse"]
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+http-body-util = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tower = { workspace = true }
+
+[dependencies]
+axum = { workspace = true }
+ipnet = { workspace = true }
+rand = { workspace = true }
+mcp-gateway-config = { workspace = true }
+mcp-gateway-router = { workspace = true }
+mcp-gateway-transport = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

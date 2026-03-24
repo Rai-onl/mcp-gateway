@@ -1,0 +1,16 @@
+[package]
+name = "mcp-gateway-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stdio bridge runtime — spawns MCP server processes and translates HTTP to stdin/stdout"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
