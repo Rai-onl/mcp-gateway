@@ -36,6 +36,13 @@ tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 zeroize = "1.8"
+tempfile = "3.27"
+humantime = "2.2"
+arc-swap = "1.7"
+async-trait = "0.1"
+region = "3.0"
+rlimit = "0.10"
+url = "2.5"
 
 # Internal workspace crates.
 mcp-gateway-credentials = { path = "credentials" }

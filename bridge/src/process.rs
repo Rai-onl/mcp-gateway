@@ -7,7 +7,10 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::process::Stdio;
+use std::sync::Arc;
 
+use mcp_gateway_config::CredentialInjection;
+use mcp_gateway_credentials::{CredentialResolver, Secret};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -15,8 +18,13 @@ use tokio::time::{Duration, timeout};
 
 use crate::handshake::{self, Handshake, HandshakeError};
 
+/// Environment-variable name used for stdio credential injection.
+/// Set on every child spawn whose `injection` is
+/// [`CredentialInjection::Env`].
+const ENV_CREDENTIAL_VARIABLE: &str = "MCP_CREDENTIAL";
+
 /// Configuration for spawning a bridge process.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SpawnConfig {
 	/// Path to the MCP server binary or script.
 	pub command: String,
@@ -24,8 +32,43 @@ pub struct SpawnConfig {
 	/// Command-line arguments.
 	pub args: Vec<String>,
 
-	/// Environment variables injected into the child process.
-	pub env: HashMap<String, String>,
+	/// Operator-supplied environment variables injected into the
+	/// child process verbatim.
+	///
+	/// Values are stored as [`Secret`] so credential-derived entries
+	/// are zeroized when the spawn config is dropped. The kernel has
+	/// already copied the env into the child by the time the parent
+	/// drops the config, so the protection bounds the parent's
+	/// in-memory exposure window.
+	pub env: HashMap<String, Secret>,
+
+	/// Resolver consulted at spawn time when `injection` is set.
+	/// Stored as a trait object so the bridge does not need to know
+	/// whether the credential is materialised (file/command/env
+	/// pre-resolved into a `StaticResolver`) or issued (OAuth or
+	/// dynamic Vault tokens behind a TTL cache).
+	pub resolver: Arc<dyn CredentialResolver>,
+
+	/// Optional credential injection metadata. Only the
+	/// [`CredentialInjection::Env`] variant applies to stdio
+	/// bridges; receiving the `Header` variant is treated as a
+	/// router-side programming error.
+	pub injection: Option<CredentialInjection>,
+}
+
+impl fmt::Debug for SpawnConfig {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		// The resolver behind the trait object has no useful Debug
+		// representation; render only the fields developers actually
+		// inspect when diagnosing a bridge spawn issue.
+		formatter
+			.debug_struct("SpawnConfig")
+			.field("command", &self.command)
+			.field("args", &self.args)
+			.field("env_keys", &self.env.keys().collect::<Vec<_>>())
+			.field("injection", &self.injection)
+			.finish_non_exhaustive()
+	}
 }
 
 /// A running stdio bridge to an MCP server process.
@@ -63,9 +106,11 @@ impl Bridge {
 		config: &SpawnConfig,
 		handshake_timeout: Duration,
 	) -> Result<Self, BridgeError> {
+		let resolved_env = resolve_environment(config).await?;
+
 		let mut cmd = Command::new(&config.command);
 		cmd.args(&config.args)
-			.envs(&config.env)
+			.envs(&resolved_env)
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
 			.stderr(Stdio::inherit())
@@ -224,11 +269,103 @@ pub enum BridgeError {
 	/// The response from the child process was not valid JSON.
 	#[error("invalid JSON response from process: {0}")]
 	InvalidResponse(serde_json::Error),
+
+	/// The named credential could not be resolved at spawn time.
+	#[error("credential '{credential}' could not be resolved: {reason}")]
+	CredentialResolution {
+		/// The name of the credential whose resolution failed.
+		credential: String,
+		/// Human-readable reason produced by the resolver.
+		reason: String,
+	},
+
+	/// The router supplied injection metadata that does not apply
+	/// to a stdio bridge — surfaces a programming error up-front
+	/// rather than silently no-ing.
+	#[error("invalid injection for stdio bridge: {0}")]
+	InvalidInjection(String),
+}
+
+/// Build the environment map applied to the child process.
+///
+/// Operator-supplied entries are cloned in first; the credential
+/// from a [`CredentialInjection::Env`] is then resolved through the
+/// supplied resolver and inserted under
+/// [`ENV_CREDENTIAL_VARIABLE`]. A `Header` injection is rejected as
+/// a router-side programming error before any I/O happens.
+async fn resolve_environment(config: &SpawnConfig) -> Result<HashMap<String, Secret>, BridgeError> {
+	let mut env = config.env.clone();
+
+	let injection = match &config.injection {
+		None => return Ok(env),
+		Some(CredentialInjection::Env { credential_name }) => credential_name,
+		Some(CredentialInjection::Header { .. }) => {
+			return Err(BridgeError::InvalidInjection(
+				"HTTP header injection is not valid for a stdio bridge".to_owned(),
+			));
+		}
+	};
+
+	let secret = config.resolver.resolve(injection).await.map_err(|reason| {
+		BridgeError::CredentialResolution {
+			credential: injection.clone(),
+			reason,
+		}
+	})?;
+	env.insert(ENV_CREDENTIAL_VARIABLE.to_owned(), secret);
+	Ok(env)
 }
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Arc;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	use async_trait::async_trait;
+	use mcp_gateway_config::CredentialInjection;
+	use mcp_gateway_credentials::CredentialResolver;
+
 	use super::*;
+
+	/// Test resolver that records every `resolve` call by name.
+	/// Used to assert the bridge resolved the right credential at
+	/// spawn time (handshake is allowed to fail later — the call
+	/// log proves resolution happened first).
+	struct CountingResolver {
+		calls: std::sync::Mutex<Vec<String>>,
+		value: String,
+	}
+
+	#[async_trait]
+	impl CredentialResolver for CountingResolver {
+		async fn resolve(&self, name: &str) -> Result<Secret, String> {
+			self.calls.lock().unwrap().push(name.to_owned());
+			Ok(Secret::new(self.value.clone()))
+		}
+	}
+
+	/// Test resolver that always fails — used to verify spawn-time
+	/// resolution failure surfaces as
+	/// [`BridgeError::CredentialResolution`] before the child
+	/// process is spawned.
+	struct FailingResolver {
+		called: AtomicUsize,
+	}
+
+	#[async_trait]
+	impl CredentialResolver for FailingResolver {
+		async fn resolve(&self, _name: &str) -> Result<Secret, String> {
+			self.called.fetch_add(1, Ordering::SeqCst);
+			Err("resolver always fails".to_owned())
+		}
+	}
+
+	fn unused_resolver() -> Arc<dyn CredentialResolver> {
+		Arc::new(CountingResolver {
+			calls: std::sync::Mutex::new(Vec::new()),
+			value: "unused".to_owned(),
+		})
+	}
 
 	/// A bridge can spawn a simple echo process (`cat`), which
 	/// reflects stdin to stdout. The handshake will fail because
@@ -241,6 +378,8 @@ mod tests {
 			command: "cat".into(),
 			args: vec![],
 			env: HashMap::new(),
+			resolver: unused_resolver(),
+			injection: None,
 		};
 
 		let err = Bridge::spawn(&config, Duration::from_secs(2))
@@ -259,6 +398,8 @@ mod tests {
 			command: "/nonexistent/binary/path".into(),
 			args: vec![],
 			env: HashMap::new(),
+			resolver: unused_resolver(),
+			injection: None,
 		};
 
 		let err = Bridge::spawn(&config, Duration::from_secs(1))
@@ -275,10 +416,135 @@ mod tests {
 			command: "true".into(),
 			args: vec![],
 			env: HashMap::new(),
+			resolver: unused_resolver(),
+			injection: None,
 		};
 
 		let _err = Bridge::spawn(&config, Duration::from_secs(1))
 			.await
 			.expect_err("immediately exiting process should fail handshake");
+	}
+
+	/// `Bridge::spawn` resolves the credential through the resolver
+	/// before launching the child. Confirmed via the call log on
+	/// the test resolver — the handshake is allowed to fail later
+	/// because `cat` is not an MCP server, but resolution happens
+	/// first regardless.
+	#[tokio::test]
+	async fn spawn_resolves_env_credential_before_launching_child() {
+		let resolver = Arc::new(CountingResolver {
+			calls: std::sync::Mutex::new(Vec::new()),
+			value: "secret-value".to_owned(),
+		});
+		let config = SpawnConfig {
+			command: "cat".into(),
+			args: vec![],
+			env: HashMap::new(),
+			resolver: Arc::clone(&resolver) as _,
+			injection: Some(CredentialInjection::Env {
+				credential_name: "stdio-token".to_owned(),
+			}),
+		};
+
+		let _outcome = Bridge::spawn(&config, Duration::from_secs(2)).await;
+
+		let calls = resolver.calls.lock().unwrap().clone();
+		assert_eq!(
+			calls,
+			vec!["stdio-token".to_owned()],
+			"the resolver must be consulted exactly once before spawn",
+		);
+	}
+
+	/// Without injection metadata, the resolver is never consulted
+	/// — operator-supplied env entries pass through verbatim.
+	#[tokio::test]
+	async fn spawn_without_injection_skips_resolver() {
+		let resolver = Arc::new(CountingResolver {
+			calls: std::sync::Mutex::new(Vec::new()),
+			value: "unused".to_owned(),
+		});
+		let config = SpawnConfig {
+			command: "true".into(),
+			args: vec![],
+			env: HashMap::new(),
+			resolver: Arc::clone(&resolver) as _,
+			injection: None,
+		};
+
+		let _outcome = Bridge::spawn(&config, Duration::from_secs(1)).await;
+
+		assert!(
+			resolver.calls.lock().unwrap().is_empty(),
+			"resolver must not be invoked when there is no injection metadata",
+		);
+	}
+
+	/// A spawn-time resolver failure short-circuits before the
+	/// child is launched and surfaces as a typed bridge error
+	/// carrying the credential name.
+	#[tokio::test]
+	async fn spawn_resolution_failure_returns_bridge_error_without_launching() {
+		let resolver = Arc::new(FailingResolver {
+			called: AtomicUsize::new(0),
+		});
+		let config = SpawnConfig {
+			command: "/nonexistent/binary/path".into(),
+			args: vec![],
+			env: HashMap::new(),
+			resolver: Arc::clone(&resolver) as _,
+			injection: Some(CredentialInjection::Env {
+				credential_name: "missing".to_owned(),
+			}),
+		};
+
+		let error = Bridge::spawn(&config, Duration::from_secs(1))
+			.await
+			.expect_err("resolver failure must surface");
+
+		match error {
+			BridgeError::CredentialResolution {
+				credential,
+				ref reason,
+			} => {
+				assert_eq!(credential, "missing");
+				assert!(
+					reason.contains("always fails"),
+					"the resolver's error message must propagate, got {reason:?}",
+				);
+			}
+			other => panic!("expected CredentialResolution error, got {other:?}"),
+		}
+		assert_eq!(
+			resolver.called.load(Ordering::SeqCst),
+			1,
+			"the resolver is consulted once and the child is never spawned",
+		);
+	}
+
+	/// Constructing a `SpawnConfig` with HTTP-only injection
+	/// metadata is a router-side programming error and is rejected
+	/// at spawn time. Bridges only consume `Env` injections.
+	#[tokio::test]
+	async fn spawn_rejects_header_injection_metadata() {
+		let config = SpawnConfig {
+			command: "true".into(),
+			args: vec![],
+			env: HashMap::new(),
+			resolver: unused_resolver(),
+			injection: Some(CredentialInjection::Header {
+				credential_name: "http-token".to_owned(),
+				header_name: "Authorization".to_owned(),
+				header_prefix: "Bearer ".to_owned(),
+			}),
+		};
+
+		let error = Bridge::spawn(&config, Duration::from_secs(1))
+			.await
+			.expect_err("header injection on a stdio bridge must be rejected");
+		assert!(
+			matches!(error, BridgeError::InvalidInjection(_)),
+			"expected InvalidInjection, got {error:?}",
+		);
 	}
 }

@@ -50,18 +50,18 @@ pub enum CertificateSource {
 }
 
 impl std::fmt::Display for CertificateSource {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Self::Explicit { cert, .. } => {
-				write!(f, "explicit ({})", cert.display())
+				write!(formatter, "explicit ({})", cert.display())
 			}
 			Self::Conventional { cert, .. } => {
-				write!(f, "conventional ({})", cert.display())
+				write!(formatter, "conventional ({})", cert.display())
 			}
 			Self::Environment { cert, .. } => {
-				write!(f, "environment ({})", cert.display())
+				write!(formatter, "environment ({})", cert.display())
 			}
-			Self::SelfSigned => write!(f, "self-signed (ephemeral)"),
+			Self::SelfSigned => write!(formatter, "self-signed (ephemeral)"),
 		}
 	}
 }

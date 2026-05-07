@@ -13,16 +13,19 @@ sse = ["mcp-gateway-config/sse", "mcp-gateway-router/sse"]
 workspace = true
 
 [dev-dependencies]
+async-trait = { workspace = true }
 http-body-util = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 tower = { workspace = true }
 
 [dependencies]
+arc-swap = { workspace = true }
 axum = { workspace = true }
 ipnet = { workspace = true }
 rand = { workspace = true }
 mcp-gateway-config = { workspace = true }
+mcp-gateway-credentials = { workspace = true }
 mcp-gateway-router = { workspace = true }
 mcp-gateway-transport = { workspace = true }
 serde = { workspace = true }

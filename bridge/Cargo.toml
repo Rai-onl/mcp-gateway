@@ -10,7 +10,12 @@ description = "Stdio bridge runtime — spawns MCP server processes and translat
 workspace = true
 
 [dependencies]
+mcp-gateway-config = { workspace = true }
+mcp-gateway-credentials = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }

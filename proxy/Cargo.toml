@@ -10,9 +10,13 @@ description = "HTTP proxy runtime — forwards MCP requests to upstream remote s
 workspace = true
 
 [dependencies]
+mcp-gateway-config = { workspace = true }
+mcp-gateway-credentials = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
+axum = { workspace = true }
 tokio = { workspace = true }

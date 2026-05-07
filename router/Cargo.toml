@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 mcp-gateway-bridge = { workspace = true }
 mcp-gateway-config = { workspace = true }
+mcp-gateway-credentials = { workspace = true }
 mcp-gateway-proxy = { workspace = true }
 mcp-gateway-transport = { workspace = true }
 serde_json = { workspace = true }

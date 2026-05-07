@@ -83,6 +83,7 @@ fn test_config() -> GatewayConfig {
 				credential: None,
 				credential_header: None,
 				credential_prefix: None,
+				credential_injection: None,
 				transport: Transport::Stdio {
 					command: test_server_path,
 					args: vec![],

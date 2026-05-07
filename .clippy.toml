@@ -1,0 +1,6 @@
+cognitive-complexity-threshold = 10
+excessive-nesting-threshold = 4
+too-many-arguments-threshold = 5
+too-many-lines-threshold = 60
+type-complexity-threshold = 200
+single-char-binding-names-threshold = 0

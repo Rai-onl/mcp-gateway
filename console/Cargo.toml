@@ -20,15 +20,24 @@ workspace = true
 [dependencies]
 axum = { workspace = true }
 clap = { workspace = true }
+humantime = { workspace = true }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 mcp-gateway-config = { workspace = true }
 mcp-gateway-credentials = { workspace = true }
 mcp-gateway-daemon = { workspace = true }
 mcp-gateway-output = { workspace = true }
 mcp-gateway-tls = { workspace = true }
+reqwest = { workspace = true }
+rlimit = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tower = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+http-body-util = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tower = { workspace = true }

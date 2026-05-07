@@ -12,10 +12,20 @@ pub use dispatch::{Router, RouterError, RouterResponse};
 #[cfg(test)]
 mod tests {
 	use std::collections::HashMap;
+	use std::sync::Arc;
 
 	use mcp_gateway_config::{GatewayConfig, ServerDefinition, Transport};
+	use mcp_gateway_credentials::{CredentialResolver, StaticResolver};
 
 	use super::*;
+
+	/// Build a no-op resolver for tests that exercise routing
+	/// surfaces unrelated to credential injection. The empty
+	/// `StaticResolver` will fail any actual `resolve` call but
+	/// these tests never trigger one.
+	fn empty_resolver() -> Arc<dyn CredentialResolver> {
+		Arc::new(StaticResolver::default())
+	}
 
 	fn test_config() -> GatewayConfig {
 		let mut servers = HashMap::new();
@@ -28,6 +38,7 @@ mod tests {
 				credential: None,
 				credential_header: None,
 				credential_prefix: None,
+				credential_injection: None,
 				transport: Transport::Stdio {
 					command: "cat".into(),
 					args: vec![],
@@ -43,6 +54,7 @@ mod tests {
 				credential: None,
 				credential_header: None,
 				credential_prefix: None,
+				credential_injection: None,
 				transport: Transport::Http {
 					url: "https://api.example.com/mcp/".into(),
 					headers: HashMap::new(),
@@ -58,6 +70,7 @@ mod tests {
 				credential: None,
 				credential_header: None,
 				credential_prefix: None,
+				credential_injection: None,
 				transport: Transport::Stdio {
 					command: "echo".into(),
 					args: vec![],
@@ -76,7 +89,7 @@ mod tests {
 	#[test]
 	fn router_lists_enabled_servers() {
 		let config = test_config();
-		let router = Router::from_config(&config).unwrap();
+		let router = Router::from_config(&config, empty_resolver()).unwrap();
 
 		let names = router.server_names();
 		assert!(names.contains(&"filesystem"));
@@ -88,7 +101,7 @@ mod tests {
 	#[tokio::test]
 	async fn unknown_server_returns_not_found() {
 		let config = test_config();
-		let router = Router::from_config(&config).unwrap();
+		let router = Router::from_config(&config, empty_resolver()).unwrap();
 
 		let message = serde_json::json!({
 			"jsonrpc": "2.0",
@@ -108,7 +121,7 @@ mod tests {
 	#[tokio::test]
 	async fn disabled_server_returns_not_found() {
 		let config = test_config();
-		let router = Router::from_config(&config).unwrap();
+		let router = Router::from_config(&config, empty_resolver()).unwrap();
 
 		let message = serde_json::json!({
 			"jsonrpc": "2.0",

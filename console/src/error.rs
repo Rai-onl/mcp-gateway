@@ -38,6 +38,18 @@ pub enum ConsoleError {
 	/// A generic I/O error that does not belong to a specific domain.
 	#[error(transparent)]
 	Io(#[from] std::io::Error),
+
+	/// An environment variable that the gateway reads at startup
+	/// holds a value that cannot be interpreted. Surfaces as a
+	/// configuration-class failure so operators can correct the
+	/// environment without touching the configuration file.
+	#[error("invalid value for environment variable {variable}: {reason}")]
+	Environment {
+		/// The environment variable that was being read.
+		variable: String,
+		/// Why the value could not be interpreted.
+		reason: String,
+	},
 }
 
 impl ConsoleError {
@@ -56,7 +68,7 @@ impl ConsoleError {
 	#[must_use]
 	pub fn exit_code(&self) -> u8 {
 		match self {
-			Self::Config(_) | Self::AppState(_) | Self::Tls(_) => 78,
+			Self::Config(_) | Self::AppState(_) | Self::Tls(_) | Self::Environment { .. } => 78,
 			Self::Bind(_) => 71,
 			Self::Serve(_) => 70,
 			Self::Io(_) => 1,
@@ -101,5 +113,17 @@ mod tests {
 	fn exit_code_for_io_error() {
 		let error = ConsoleError::Io(std::io::Error::other("disk full"));
 		assert_eq!(error.exit_code(), 1);
+	}
+
+	/// Invalid environment variables map to `EX_CONFIG` (78) so
+	/// operators see the same class of failure as a bad
+	/// configuration file.
+	#[test]
+	fn exit_code_for_environment_error() {
+		let error = ConsoleError::Environment {
+			variable: "MCP_CREDENTIAL_TIMEOUT".to_owned(),
+			reason: "not a duration".to_owned(),
+		};
+		assert_eq!(error.exit_code(), 78);
 	}
 }

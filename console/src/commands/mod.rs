@@ -4,6 +4,9 @@
 //! delegates to the corresponding domain library crate. This module
 //! contains no logic itself — it is purely a dispatcher.
 
+pub mod credential_resolution;
+pub mod memory;
+pub mod reload;
 pub mod serve;
 
 use clap::{Parser, Subcommand};

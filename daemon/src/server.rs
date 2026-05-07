@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -15,9 +16,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde_json::Value;
 
-use mcp_gateway_config::{
-	CredentialResolutionError, CredentialResolver, GatewayConfig, resolve_credentials,
-};
+use mcp_gateway_config::{CredentialResolutionError, GatewayConfig, resolve_credentials};
+use mcp_gateway_credentials::CredentialResolver;
 use mcp_gateway_router::{self as gateway_router, RouterError, RouterResponse};
 
 use crate::identity::{TrustedProxyConfig, extract_client_identity};
@@ -37,16 +37,40 @@ pub enum AppStateError {
 	Router(#[from] RouterError),
 }
 
-/// Shared application state passed to all handlers.
-pub struct AppState {
+/// The swappable portion of `AppState`.
+///
+/// Reload replaces this whole struct atomically via [`ArcSwap`] so
+/// in-flight requests holding the previous `Arc<AppStateInner>`
+/// finish on it while new requests load the new one. The unresolved
+/// configuration kept here drives `/ready` and the server-card
+/// endpoint; they reflect the post-reload server set.
+pub struct AppStateInner {
 	router: gateway_router::Router,
 	/// The original configuration before credential resolution.
 	/// Intentionally stores the unresolved config so that health
 	/// and server card endpoints never expose resolved secrets.
 	config: GatewayConfig,
+}
+
+/// Shared application state passed to all handlers.
+///
+/// Holds an [`ArcSwap`] of the swappable [`AppStateInner`] so the
+/// gateway's router and configuration can be replaced atomically
+/// without dropping `AppState` itself. Sessions persist across
+/// reloads — clients keep their issued session IDs even when the
+/// configuration changes underneath.
+///
+/// Note: certain top-level fields are read once when the axum
+/// application is built and remain frozen for the process lifetime.
+/// Reload picks up changes to `servers` and credential references;
+/// changes to `max_body_bytes`, `trusted_proxies`, and
+/// `client_identity_headers` require a process restart.
+pub struct AppState {
+	inner: ArcSwap<AppStateInner>,
 	/// Session IDs issued by this gateway instance. Client-supplied
 	/// session IDs are only accepted if they appear in this set;
-	/// unknown IDs are replaced with a fresh one.
+	/// unknown IDs are replaced with a fresh one. Persists across
+	/// reloads so reload does not log clients out.
 	sessions: RwLock<HashSet<String>>,
 }
 
@@ -65,27 +89,70 @@ impl AppState {
 	/// resolved, or if a server runtime cannot be initialised.
 	pub fn new(
 		config: GatewayConfig,
-		credential_resolver: Option<&CredentialResolver>,
+		credential_resolver: Option<Arc<dyn CredentialResolver>>,
 	) -> Result<Self, AppStateError> {
-		let resolved_config = match credential_resolver {
-			Some(resolver) => resolve_credentials(&config, resolver)?,
-			None => config.clone(),
-		};
-
-		let router = gateway_router::Router::from_config(&resolved_config)?;
+		let inner = build_inner(config, credential_resolver)?;
 		Ok(Self {
-			router,
-			config,
+			inner: ArcSwap::from_pointee(inner),
 			sessions: RwLock::new(HashSet::new()),
 		})
+	}
+
+	/// Atomically replace the router and resolved configuration in
+	/// place. In-flight requests holding the previous inner finish
+	/// on it; subsequent requests load the new inner. On failure no
+	/// swap happens and the previous inner stays installed.
+	///
+	/// # Errors
+	///
+	/// Returns the same errors as [`AppState::new`] if the new
+	/// configuration cannot be resolved or the router cannot be
+	/// built. The state is unchanged on error.
+	pub fn replace_inner(
+		&self,
+		config: GatewayConfig,
+		credential_resolver: Option<Arc<dyn CredentialResolver>>,
+	) -> Result<(), AppStateError> {
+		let inner = build_inner(config, credential_resolver)?;
+		self.inner.store(Arc::new(inner));
+		Ok(())
+	}
+
+	/// Snapshot the current inner. Calls within a single request
+	/// should reuse this snapshot rather than calling `current` more
+	/// than once, so all dispatch decisions stay consistent even if
+	/// reload swaps the inner mid-request.
+	pub fn current(&self) -> Arc<AppStateInner> {
+		self.inner.load_full()
 	}
 
 	/// Check all active stdio bridge processes and log any that
 	/// have exited. Call this periodically from a background task
 	/// so that crashes are detected promptly.
 	pub async fn check_bridge_health(&self) {
-		self.router.check_bridge_health().await;
+		self.inner.load().router.check_bridge_health().await;
 	}
+}
+
+/// Translate credential references into use-time injection metadata,
+/// build the router (handing it the resolver so the proxy and bridge
+/// runtimes can fetch values per-use), and bundle the result into an
+/// `AppStateInner` ready to install via `ArcSwap`.
+///
+/// `None` for the resolver substitutes a [`StaticResolver`] holding
+/// no entries: any server with a credential reference will surface a
+/// lookup error at use time, which matches the previous "no resolver
+/// available" behaviour and keeps server-less test fixtures working.
+fn build_inner(
+	config: GatewayConfig,
+	credential_resolver: Option<Arc<dyn CredentialResolver>>,
+) -> Result<AppStateInner, AppStateError> {
+	let resolved_config = resolve_credentials(&config);
+	let resolver = credential_resolver.unwrap_or_else(|| {
+		Arc::new(mcp_gateway_credentials::StaticResolver::default()) as Arc<dyn CredentialResolver>
+	});
+	let router = gateway_router::Router::from_config(&resolved_config, resolver)?;
+	Ok(AppStateInner { router, config })
 }
 
 /// Build the axum application with all routes.
@@ -95,13 +162,19 @@ impl AppState {
 /// headers from trusted proxy requests and strips them from
 /// untrusted sources.
 pub fn build_app(state: &Arc<AppState>) -> Router {
+	// Snapshot the configuration once at app-build time. Top-level
+	// fields like `max_body_bytes`, `trusted_proxies`, and
+	// `client_identity_headers` are wired into middleware here and
+	// stay frozen for the process lifetime — reload picks up
+	// `servers` and credential references but not these.
+	let initial = state.inner.load();
 	let application = Router::new()
 		.route("/servers/{name}/mcp", post(handle_mcp))
 		.route("/health", get(handle_health))
 		.route("/ready", get(handle_ready))
 		.route("/.well-known/mcp-server-card", get(handle_server_card))
 		.with_state(Arc::clone(state))
-		.layer(DefaultBodyLimit::max(state.config.max_body_bytes))
+		.layer(DefaultBodyLimit::max(initial.config.max_body_bytes))
 		.layer(middleware::from_fn(set_security_headers));
 
 	// Always install the identity middleware to strip forwarded
@@ -109,17 +182,17 @@ pub fn build_app(state: &Arc<AppState>) -> Router {
 	// are configured, the middleware also extracts client identity
 	// from requests originating within those networks.
 	let proxy_config = Arc::new(TrustedProxyConfig {
-		trusted_networks: state.config.trusted_proxies.clone(),
-		identity_headers: state
+		trusted_networks: initial.config.trusted_proxies.clone(),
+		identity_headers: initial
 			.config
 			.client_identity_headers
 			.clone()
 			.unwrap_or_default(),
 	});
 
-	if !state.config.trusted_proxies.is_empty() {
+	if !initial.config.trusted_proxies.is_empty() {
 		tracing::info!(
-			networks = ?state.config.trusted_proxies,
+			networks = ?initial.config.trusted_proxies,
 			certificate_header = %proxy_config.identity_headers.certificate,
 			chain_header = %proxy_config.identity_headers.certificate_chain,
 			"trusted proxy identity extraction enabled"
@@ -190,85 +263,30 @@ async fn handle_mcp(
 	request_headers: HeaderMap,
 	body: String,
 ) -> Response {
-	// Validate server name before any logging or dispatch to
-	// prevent log pollution from malicious path parameters.
-	if !is_valid_server_name(&server_name) {
-		return json_rpc_error(
-			StatusCode::BAD_REQUEST,
-			-32600,
-			"Invalid server name",
-			None,
-			"",
-			&TraceContext::empty(),
-		);
-	}
-
-	// Reject requests without a JSON content type.
-	if !is_json_content_type(&request_headers) {
-		return json_rpc_error(
-			StatusCode::UNSUPPORTED_MEDIA_TYPE,
-			-32600,
-			"Content-Type must be application/json",
-			None,
-			"",
-			&TraceContext::empty(),
-		);
+	if let Some(early) = check_request_preconditions(&server_name, &request_headers) {
+		return early;
 	}
 
 	let started_at = Instant::now();
-
 	let session_id = resolve_session_id(&request_headers, &state.sessions);
+	let trace = extract_trace_context(&request_headers);
 
-	// Propagate W3C trace context for distributed tracing.
-	// Only accept values matching the traceparent format
-	// (version-traceid-parentid-traceflags).
-	let traceparent = request_headers
-		.get("traceparent")
-		.and_then(|value| value.to_str().ok())
-		.filter(|value| is_valid_traceparent(value))
-		.map(String::from);
-
-	// Propagate tracestate alongside traceparent per W3C Trace
-	// Context. Only forward tracestate when traceparent is present.
-	let tracestate = traceparent.as_ref().and_then(|_| {
-		request_headers
-			.get("tracestate")
-			.and_then(|value| value.to_str().ok())
-			.map(String::from)
-	});
-
-	let trace = TraceContext {
-		traceparent,
-		tracestate,
+	let message = match parse_request_body(&body, &server_name, &session_id, &trace) {
+		Ok(value) => value,
+		Err(response) => return *response,
 	};
 
-	let message: Value = if let Ok(value) = serde_json::from_str(&body) {
-		value
-	} else {
-		tracing::warn!(
-			server = %server_name,
-			session = %session_id,
-			"received malformed JSON"
-		);
-		return json_rpc_error(
-			StatusCode::BAD_REQUEST,
-			-32700,
-			"Parse error",
-			None,
-			&session_id,
-			&trace,
-		);
-	};
-
-	// Reject batch requests (JSON arrays) explicitly.
 	if message.is_array() {
+		let context = RequestContext {
+			request_id: None,
+			session_id: &session_id,
+			trace: &trace,
+		};
 		return json_rpc_error(
 			StatusCode::BAD_REQUEST,
 			-32600,
 			"Batch requests are not supported",
-			None,
-			&session_id,
-			&trace,
+			&context,
 		);
 	}
 
@@ -288,19 +306,79 @@ async fn handle_mcp(
 
 	tracing::debug!("dispatching request");
 
-	let result = state.router.dispatch(&server_name, &message).await;
+	// Snapshot the inner once so an in-flight reload swap does not
+	// surface a half-changed view to this request.
+	let inner = state.current();
+	let result = inner.router.dispatch(&server_name, &message).await;
 	let duration = started_at.elapsed();
+	let context = RequestContext {
+		request_id: message.get("id"),
+		session_id: &session_id,
+		trace: &trace,
+	};
 
-	let request_id = message.get("id");
+	dispatch_response(result, duration, &server_name, &context)
+}
 
-	dispatch_response(
-		result,
-		duration,
-		&server_name,
-		request_id,
-		&session_id,
-		&trace,
-	)
+/// Reject requests with invalid server names or non-JSON bodies
+/// before any logging, parsing, or dispatch happens.
+///
+/// Returns `Some(response)` when the request must be rejected and
+/// `None` to indicate the caller should proceed.
+fn check_request_preconditions(server_name: &str, headers: &HeaderMap) -> Option<Response> {
+	let empty_trace = TraceContext::empty();
+	let context = RequestContext::for_early_failure(&empty_trace);
+
+	if !is_valid_server_name(server_name) {
+		return Some(json_rpc_error(
+			StatusCode::BAD_REQUEST,
+			-32600,
+			"Invalid server name",
+			&context,
+		));
+	}
+	if !is_json_content_type(headers) {
+		return Some(json_rpc_error(
+			StatusCode::UNSUPPORTED_MEDIA_TYPE,
+			-32600,
+			"Content-Type must be application/json",
+			&context,
+		));
+	}
+	None
+}
+
+/// Parse the request body as JSON, producing a JSON-RPC parse-error
+/// response if it is malformed. Mirrors JSON-RPC 2.0 section 4.2.
+///
+/// The error variant is boxed because `axum::Response` exceeds the
+/// `result_large_err` size budget; parse failures are the rare path,
+/// so the extra allocation is acceptable in exchange for the
+/// shallower call-site logic.
+fn parse_request_body(
+	body: &str,
+	server_name: &str,
+	session_id: &str,
+	trace: &TraceContext,
+) -> Result<Value, Box<Response>> {
+	serde_json::from_str(body).map_err(|_| {
+		tracing::warn!(
+			server = %server_name,
+			session = %session_id,
+			"received malformed JSON"
+		);
+		let context = RequestContext {
+			request_id: None,
+			session_id,
+			trace,
+		};
+		Box::new(json_rpc_error(
+			StatusCode::BAD_REQUEST,
+			-32700,
+			"Parse error",
+			&context,
+		))
+	})
 }
 
 /// Convert a dispatch result into an HTTP response with appropriate
@@ -309,23 +387,21 @@ fn dispatch_response(
 	result: Result<RouterResponse, gateway_router::RouterError>,
 	duration: std::time::Duration,
 	server_name: &str,
-	request_id: Option<&Value>,
-	session_id: &str,
-	trace: &TraceContext,
+	context: &RequestContext<'_>,
 ) -> Response {
 	let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
 
 	match result {
 		Ok(RouterResponse::Reply(response)) => {
 			tracing::info!(duration_ms, "request completed");
-			json_rpc_response(StatusCode::OK, &response, session_id, trace)
+			json_rpc_response(StatusCode::OK, &response, context.session_id, context.trace)
 		}
 		Ok(RouterResponse::Accepted) => {
 			tracing::info!(duration_ms, "notification accepted");
 			let mut response = StatusCode::ACCEPTED.into_response();
 			response
 				.headers_mut()
-				.insert(SESSION_HEADER, session_id.parse().unwrap());
+				.insert(SESSION_HEADER, context.session_id.parse().unwrap());
 			response
 		}
 		Err(gateway_router::RouterError::ServerNotFound(_)) => {
@@ -334,9 +410,7 @@ fn dispatch_response(
 				StatusCode::NOT_FOUND,
 				-32001,
 				&format!("Server not found: {server_name}"),
-				request_id,
-				session_id,
-				trace,
+				context,
 			)
 		}
 		Err(gateway_router::RouterError::MalformedMessage) => {
@@ -345,9 +419,7 @@ fn dispatch_response(
 				StatusCode::BAD_REQUEST,
 				-32600,
 				"Invalid request — missing method field",
-				request_id,
-				session_id,
-				trace,
+				context,
 			)
 		}
 		Err(error) => {
@@ -356,9 +428,7 @@ fn dispatch_response(
 				StatusCode::INTERNAL_SERVER_ERROR,
 				-32603,
 				"Internal error",
-				request_id,
-				session_id,
-				trace,
+				context,
 			)
 		}
 	}
@@ -371,7 +441,8 @@ fn dispatch_response(
 /// endpoint path. Follows the MCP Server Card convention for
 /// server discovery via `.well-known` URLs.
 async fn handle_server_card(State(state): State<Arc<AppState>>) -> Response {
-	let servers: Vec<Value> = state
+	let inner = state.current();
+	let servers: Vec<Value> = inner
 		.config
 		.servers
 		.iter()
@@ -424,7 +495,8 @@ async fn handle_health() -> Response {
 /// the gateway has at least one enabled server. Returns 503
 /// when no servers are configured or all are disabled.
 async fn handle_ready(State(state): State<Arc<AppState>>) -> Response {
-	let servers: serde_json::Map<String, Value> = state
+	let inner = state.current();
+	let servers: serde_json::Map<String, Value> = inner
 		.config
 		.servers
 		.iter()
@@ -477,6 +549,55 @@ impl TraceContext {
 	}
 }
 
+/// Per-request identifying information passed to response builders.
+///
+/// Bundles the JSON-RPC request id, MCP session id, and W3C trace
+/// context so response-building functions can stay below the
+/// workspace's `too-many-arguments-threshold`.
+struct RequestContext<'request> {
+	request_id: Option<&'request Value>,
+	session_id: &'request str,
+	trace: &'request TraceContext,
+}
+
+impl RequestContext<'_> {
+	/// A context with no JSON-RPC id, empty session, and no trace.
+	/// Used for very early validation failures before any of those
+	/// values can be extracted from the request.
+	const fn for_early_failure(trace: &TraceContext) -> RequestContext<'_> {
+		RequestContext {
+			request_id: None,
+			session_id: "",
+			trace,
+		}
+	}
+}
+
+/// Extract the W3C Trace Context from request headers.
+///
+/// Returns an empty context when `traceparent` is missing or
+/// malformed; `tracestate` is only forwarded when `traceparent` is
+/// present, per the W3C Trace Context specification.
+fn extract_trace_context(headers: &HeaderMap) -> TraceContext {
+	let traceparent = headers
+		.get("traceparent")
+		.and_then(|value| value.to_str().ok())
+		.filter(|value| is_valid_traceparent(value))
+		.map(String::from);
+
+	let tracestate = traceparent.as_ref().and_then(|_| {
+		headers
+			.get("tracestate")
+			.and_then(|value| value.to_str().ok())
+			.map(String::from)
+	});
+
+	TraceContext {
+		traceparent,
+		tracestate,
+	}
+}
+
 /// Build a JSON-RPC response with session and trace headers.
 fn json_rpc_response(
 	status: StatusCode,
@@ -514,16 +635,15 @@ fn json_rpc_response(
 ///
 /// When the request `id` is known (parsed successfully), it is
 /// echoed in the error response per JSON-RPC 2.0 section 5.1.
-/// When the `id` cannot be determined (parse error), pass `None`.
+/// When the `id` cannot be determined (parse error), the context's
+/// `request_id` is `None` and the response carries `null`.
 fn json_rpc_error(
 	status: StatusCode,
 	code: i32,
 	message: &str,
-	request_id: Option<&Value>,
-	session_id: &str,
-	trace: &TraceContext,
+	context: &RequestContext<'_>,
 ) -> Response {
-	let id = request_id.unwrap_or(&Value::Null);
+	let id = context.request_id.unwrap_or(&Value::Null);
 	let body = serde_json::json!({
 		"jsonrpc": "2.0",
 		"error": {
@@ -533,7 +653,7 @@ fn json_rpc_error(
 		"id": id
 	});
 
-	json_rpc_response(status, &body, session_id, trace)
+	json_rpc_response(status, &body, context.session_id, context.trace)
 }
 
 /// Accept a client-supplied session ID only if it was previously
@@ -605,6 +725,7 @@ mod tests {
 				credential: None,
 				credential_header: None,
 				credential_prefix: None,
+				credential_injection: None,
 				transport: Transport::Http {
 					url: "https://api.example.com/mcp/".into(),
 					headers: HashMap::new(),

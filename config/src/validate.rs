@@ -74,6 +74,7 @@ mod tests {
 						credential: None,
 						credential_header: None,
 						credential_prefix: None,
+						credential_injection: None,
 						transport: Transport::Stdio {
 							command: "echo".into(),
 							args: vec![],
@@ -88,6 +89,7 @@ mod tests {
 						credential: None,
 						credential_header: None,
 						credential_prefix: None,
+						credential_injection: None,
 						transport: Transport::Http {
 							url: "https://api.example.com/mcp/".into(),
 							headers: HashMap::new(),
@@ -127,6 +129,7 @@ mod tests {
 					credential: None,
 					credential_header: None,
 					credential_prefix: None,
+					credential_injection: None,
 					transport: Transport::Stdio {
 						command: String::new(),
 						args: vec![],
@@ -155,6 +158,7 @@ mod tests {
 					credential: None,
 					credential_header: None,
 					credential_prefix: None,
+					credential_injection: None,
 					transport: Transport::Http {
 						url: String::new(),
 						headers: HashMap::new(),
@@ -183,6 +187,7 @@ mod tests {
 					credential: None,
 					credential_header: None,
 					credential_prefix: None,
+					credential_injection: None,
 					transport: Transport::Http {
 						url: "api.example.com/mcp/".into(),
 						headers: HashMap::new(),
@@ -211,6 +216,7 @@ mod tests {
 					credential: None,
 					credential_header: None,
 					credential_prefix: None,
+					credential_injection: None,
 					transport: Transport::Stdio {
 						command: String::new(),
 						args: vec![],
@@ -239,6 +245,7 @@ mod tests {
 						credential: None,
 						credential_header: None,
 						credential_prefix: None,
+						credential_injection: None,
 						transport: Transport::Stdio {
 							command: String::new(),
 							args: vec![],
@@ -253,6 +260,7 @@ mod tests {
 						credential: None,
 						credential_header: None,
 						credential_prefix: None,
+						credential_injection: None,
 						transport: Transport::Http {
 							url: String::new(),
 							headers: HashMap::new(),

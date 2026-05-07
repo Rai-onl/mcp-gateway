@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mcp_gateway_bridge::{Bridge, SpawnConfig};
-use mcp_gateway_config::{GatewayConfig, ServerDefinition, Transport};
+use mcp_gateway_config::{CredentialInjection, GatewayConfig, ServerDefinition, Transport};
+use mcp_gateway_credentials::{CredentialResolver, Secret};
 use mcp_gateway_proxy::Proxy;
 use mcp_gateway_transport::MessageKind;
 use serde_json::Value;
@@ -21,6 +22,17 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default timeout for a single MCP request to a bridge process.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Borrowed view of the stdio invocation parameters held by a
+/// `ServerDefinition`. Bundling them into one parameter keeps
+/// `dispatch_stdio`'s signature inside the workspace's
+/// `too-many-arguments-threshold`.
+struct StdioInvocation<'definition> {
+	command: &'definition str,
+	args: &'definition [String],
+	env: &'definition HashMap<String, Secret>,
+	injection: Option<&'definition CredentialInjection>,
+}
 
 /// Response from dispatching an MCP message through the router.
 #[derive(Debug)]
@@ -44,6 +56,12 @@ pub struct Router {
 
 	/// HTTP proxy instances keyed by server name.
 	proxies: HashMap<String, Proxy>,
+
+	/// Credential resolver shared with the proxy and bridge
+	/// runtimes. Each `Proxy` already holds its own `Arc` clone for
+	/// per-request use; bridges are spawned lazily, so the router
+	/// hands the resolver to `Bridge::spawn` at the spawn point.
+	credential_resolver: Arc<dyn CredentialResolver>,
 }
 
 impl Router {
@@ -57,7 +75,10 @@ impl Router {
 	///
 	/// Returns an error if an HTTP proxy client cannot be
 	/// constructed (TLS backend misconfiguration).
-	pub fn from_config(config: &GatewayConfig) -> Result<Self, RouterError> {
+	pub fn from_config(
+		config: &GatewayConfig,
+		credential_resolver: Arc<dyn CredentialResolver>,
+	) -> Result<Self, RouterError> {
 		let servers: HashMap<String, ServerDefinition> = config
 			.servers
 			.iter()
@@ -74,8 +95,13 @@ impl Router {
 		let mut proxies = HashMap::new();
 		for (name, definition) in &servers {
 			if let Transport::Http { url, headers } = &definition.transport {
-				let proxy = Proxy::new(url.clone(), headers.clone())
-					.map_err(|error| RouterError::Configuration(error.to_string()))?;
+				let proxy = Proxy::new(
+					url.clone(),
+					headers.clone(),
+					Arc::clone(&credential_resolver),
+					definition.credential_injection.clone(),
+				)
+				.map_err(|error| RouterError::Configuration(error.to_string()))?;
 				proxies.insert(name.clone(), proxy);
 			}
 		}
@@ -84,6 +110,7 @@ impl Router {
 			servers,
 			bridges,
 			proxies,
+			credential_resolver,
 		})
 	}
 
@@ -134,7 +161,13 @@ impl Router {
 
 		match &definition.transport {
 			Transport::Stdio { command, args } => {
-				self.dispatch_stdio(server_name, command, args, &definition.env, message, kind)
+				let invocation = StdioInvocation {
+					command,
+					args,
+					env: &definition.env,
+					injection: definition.credential_injection.as_ref(),
+				};
+				self.dispatch_stdio(server_name, &invocation, message, kind)
 					.await
 			}
 			Transport::Http { .. } => self.dispatch_http(server_name, message, kind).await,
@@ -154,9 +187,7 @@ impl Router {
 	async fn dispatch_stdio(
 		&self,
 		server_name: &str,
-		command: &str,
-		args: &[String],
-		env: &HashMap<String, String>,
+		invocation: &StdioInvocation<'_>,
 		message: &Value,
 		kind: MessageKind,
 	) -> Result<RouterResponse, RouterError> {
@@ -179,9 +210,11 @@ impl Router {
 		// or after a crash.
 		if bridge_guard.is_none() {
 			let spawn_config = SpawnConfig {
-				command: command.to_owned(),
-				args: args.to_vec(),
-				env: env.clone(),
+				command: invocation.command.to_owned(),
+				args: invocation.args.to_vec(),
+				env: invocation.env.clone(),
+				resolver: Arc::clone(&self.credential_resolver),
+				injection: invocation.injection.cloned(),
 			};
 
 			let bridge = Bridge::spawn(&spawn_config, HANDSHAKE_TIMEOUT)
