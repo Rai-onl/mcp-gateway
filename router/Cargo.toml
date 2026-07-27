@@ -15,9 +15,21 @@ workspace = true
 [dependencies]
 mcp-gateway-bridge = { workspace = true }
 mcp-gateway-config = { workspace = true }
+mcp-gateway-credentials = { workspace = true }
 mcp-gateway-proxy = { workspace = true }
 mcp-gateway-transport = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+mcp-gateway-config = { workspace = true }
+mcp-gateway-credentials = { workspace = true }
+# Installs a crypto provider so tests that build a Router with an HTTP
+# server (which constructs a Proxy, eagerly building a reqwest client
+# with no bundled provider) have a process default. `ring` is a
+# test-only choice; the binary selects the real provider.
+mcp-gateway-crypto = { workspace = true, features = ["ring"] }
+serde_json = { workspace = true }
+tokio = { workspace = true }

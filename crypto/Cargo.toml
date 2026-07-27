@@ -1,0 +1,24 @@
+[package]
+name = "mcp-gateway-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Build-time selection of the rustls cryptographic provider (ring, aws-lc-rs, or FIPS)"
+
+[lints]
+workspace = true
+
+[features]
+# Exactly one provider must be enabled. A default is provided so the
+# crate builds and tests standalone; dependents set default-features =
+# false and forward the flavour chosen by the binary, so the choice is
+# made in one place rather than unified from several.
+default = ["ring"]
+ring = ["rustls/ring"]
+aws-lc-rs = ["rustls/aws-lc-rs"]
+# FIPS builds on aws-lc-rs plus rustls's validated FIPS module.
+fips = ["aws-lc-rs", "rustls/fips"]
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }

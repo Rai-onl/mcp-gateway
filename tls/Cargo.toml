@@ -7,14 +7,22 @@ repository.workspace = true
 description = "TLS configuration and certificate discovery for the MCP gateway"
 
 [features]
+default = ["ring"]
+# Provider flavour, forwarded to the shared selector crate. The rustls
+# provider is chosen there; this crate needs only rustls's config
+# builders, so it enables no provider feature of its own.
+ring = ["mcp-gateway-crypto/ring"]
+aws-lc-rs = ["mcp-gateway-crypto/aws-lc-rs"]
+fips = ["mcp-gateway-crypto/fips"]
 self-signed = ["dep:rcgen"]
 
 [lints]
 workspace = true
 
 [dependencies]
+mcp-gateway-crypto = { workspace = true }
 rcgen = { workspace = true, optional = true }
-rustls = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-pemfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

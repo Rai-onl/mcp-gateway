@@ -30,7 +30,7 @@ mod tests {
 		assert_eq!(classify(&value), MessageKind::Notification);
 	}
 
-	/// A message with a null `id` is still a request — the JSON-RPC
+	/// A message with a null `id` is still a request: the JSON-RPC
 	/// spec allows null IDs for requests that the client does not
 	/// need to correlate with a specific response.
 	#[test]
@@ -39,7 +39,7 @@ mod tests {
 		assert_eq!(classify(&value), MessageKind::Request);
 	}
 
-	/// A message with a string `id` is a request — the JSON-RPC
+	/// A message with a string `id` is a request: the JSON-RPC
 	/// spec allows both integer and string IDs.
 	#[test]
 	fn message_with_string_id_is_request() {
@@ -54,7 +54,7 @@ mod tests {
 		assert_eq!(classify_str("not json at all"), MessageKind::Malformed);
 	}
 
-	/// An empty JSON object is malformed — it lacks the required
+	/// An empty JSON object is malformed: it lacks the required
 	/// `jsonrpc` and `method` fields.
 	#[test]
 	fn empty_object_is_malformed() {

@@ -2,7 +2,7 @@
 //!
 //! Initialises tracing, detects output mode, and dispatches to the
 //! appropriate subcommand handler. The console binary is a thin
-//! dispatcher — all logic lives in the domain library crates.
+//! dispatcher; all logic lives in the domain library crates.
 
 mod commands;
 mod error;
@@ -15,6 +15,11 @@ use tracing_subscriber::EnvFilter;
 use mcp_gateway_output::{OutputMode, Renderer, detect_colour};
 
 fn main() -> ExitCode {
+	// Install the selected rustls provider as the process default before
+	// any TLS work. Outbound HTTP clients are built without a bundled
+	// provider and fall back on this one.
+	mcp_gateway_crypto::install();
+
 	let console = commands::Console::parse();
 
 	init_tracing();

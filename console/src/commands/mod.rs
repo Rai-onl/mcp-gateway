@@ -2,8 +2,11 @@
 //!
 //! Each subcommand module handles argument parsing via clap and
 //! delegates to the corresponding domain library crate. This module
-//! contains no logic itself — it is purely a dispatcher.
+//! contains no logic itself; it is purely a dispatcher.
 
+pub mod credential_resolution;
+pub mod memory;
+pub mod reload;
 pub mod serve;
 
 use clap::{Parser, Subcommand};
@@ -12,7 +15,7 @@ use mcp_gateway_output::Renderer;
 
 use crate::error::ConsoleError;
 
-/// MCP gateway — route MCP requests to server runtimes.
+/// MCP gateway: route MCP requests to server runtimes.
 ///
 /// The gateway exposes MCP servers over Streamable HTTP, bridging
 /// stdio-based servers and proxying remote HTTP servers through a

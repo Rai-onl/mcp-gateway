@@ -1,10 +1,10 @@
 [workspace]
-members = ["transport", "config", "bridge", "proxy", "router", "daemon", "console", "output", "credentials", "sse", "tls"]
+members = ["transport", "config", "bridge", "proxy", "router", "daemon", "console", "output", "credentials", "sse", "tls", "auth", "crypto"]
 resolver = "3"
 exclude = ["tests/fixture"]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.3.0"
 edition = "2024"
 license = "LGPL-3.0-or-later"
 repository = "https://gitlab.com/rai.onl/mcp/gateway"
@@ -25,26 +25,47 @@ http-body-util = "0.1"
 ipnet = { version = "2.11", features = ["serde"] }
 rand = "0.9"
 rcgen = "0.13"
-reqwest = { version = "0.13", features = ["json"] }
-rustls = "0.23"
+# No bundled crypto provider: the provider is chosen by mcp-gateway-crypto
+# and installed as the process default, so reqwest never pulls a second
+# one. Keeps the rest of reqwest's usual defaults (charset, http2,
+# system-proxy).
+reqwest = { version = "0.13", default-features = false, features = ["json", "charset", "http2", "system-proxy", "rustls-no-provider"] }
+# No default features: rustls's defaults enable the aws-lc-rs provider,
+# which would link a second provider alongside the one mcp-gateway-crypto
+# selects. Any crate inheriting this must add the features it needs.
+rustls = { version = "0.23", default-features = false }
 rustls-pemfile = "2.2"
+sha2 = "0.10"
+base64 = "0.22"
+x509-parser = "0.16"
+jsonwebtoken = "9"
 reqwest-eventsource = "0.6"
 thiserror = "2.0"
-tokio = { version = "1.50", features = ["process", "io-util", "rt", "rt-multi-thread", "net", "macros", "signal", "time"] }
-tokio-rustls = "0.26"
+tokio = { version = "1.50", features = ["process", "io-util", "rt", "rt-multi-thread", "net", "macros", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 zeroize = "1.8"
+tempfile = "3.27"
+humantime = "2.2"
+arc-swap = "1.7"
+async-trait = "0.1"
+region = "3.0"
+rlimit = "0.10"
+url = "2.5"
 
 # Internal workspace crates.
+mcp-gateway-auth = { path = "auth", default-features = false }
 mcp-gateway-credentials = { path = "credentials" }
 mcp-gateway-bridge = { path = "bridge" }
-mcp-gateway-daemon = { path = "daemon" }
+mcp-gateway-daemon = { path = "daemon", default-features = false }
 mcp-gateway-output = { path = "output" }
 mcp-gateway-proxy = { path = "proxy" }
 mcp-gateway-router = { path = "router" }
 mcp-gateway-config = { path = "config" }
+mcp-gateway-crypto = { path = "crypto", default-features = false }
 mcp-gateway-sse = { path = "sse" }
-mcp-gateway-tls = { path = "tls" }
+mcp-gateway-tls = { path = "tls", default-features = false }
 mcp-gateway-transport = { path = "transport" }

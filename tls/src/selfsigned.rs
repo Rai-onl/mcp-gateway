@@ -16,7 +16,7 @@ use crate::{CertificateSource, TlsError};
 ///
 /// The certificate covers `localhost`, `127.0.0.1`, and `::1`
 /// as Subject Alternative Names. It is valid from the moment of
-/// generation — expiry is left to rcgen's default (which is
+/// generation; expiry is left to rcgen's default (which is
 /// reasonable for ephemeral development use).
 ///
 /// # Errors
@@ -40,7 +40,9 @@ pub fn generate() -> Result<(ServerConfig, CertificateSource), TlsError> {
 		"generated ephemeral self-signed certificate for localhost (valid for ~90 days)"
 	);
 
-	let config = ServerConfig::builder()
+	let config = ServerConfig::builder_with_provider(mcp_gateway_crypto::provider())
+		.with_safe_default_protocol_versions()
+		.map_err(TlsError::Rustls)?
 		.with_no_client_auth()
 		.with_single_cert(vec![cert_der], key_der)
 		.map_err(TlsError::Rustls)?;

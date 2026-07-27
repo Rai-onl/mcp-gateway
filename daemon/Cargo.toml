@@ -7,22 +7,40 @@ repository.workspace = true
 description = "HTTP daemon — axum server exposing MCP endpoints and health checks"
 
 [features]
+default = ["ring"]
+# Provider flavour, forwarded to the auth crate (the daemon's only
+# rustls-provider-bearing dependency).
+ring = ["mcp-gateway-auth/ring"]
+aws-lc-rs = ["mcp-gateway-auth/aws-lc-rs"]
+fips = ["mcp-gateway-auth/fips"]
 sse = ["mcp-gateway-config/sse", "mcp-gateway-router/sse"]
 
 [lints]
 workspace = true
 
 [dev-dependencies]
+async-trait = { workspace = true }
 http-body-util = { workspace = true }
+# Installs the selected crypto provider so tests that proxy to an HTTPS
+# upstream have a process default before reqwest sets up its TLS layer.
+mcp-gateway-crypto = { workspace = true }
+# Stub authorisation server for the inbound-authentication wiring
+# tests: builds the auth state the daemon mounts (issue #31). The
+# `control` feature exposes key rotation, fault injection, and
+# introspection programming, which the reload tests drive (issue #36).
+mockoidc-kit = { git = "https://github.com/sinetti-dev/mockoidc-rs", tag = "v0.0.5", features = ["control"] }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 tower = { workspace = true }
 
 [dependencies]
+arc-swap = { workspace = true }
 axum = { workspace = true }
 ipnet = { workspace = true }
 rand = { workspace = true }
+mcp-gateway-auth = { workspace = true }
 mcp-gateway-config = { workspace = true }
+mcp-gateway-credentials = { workspace = true }
 mcp-gateway-router = { workspace = true }
 mcp-gateway-transport = { workspace = true }
 serde = { workspace = true }
