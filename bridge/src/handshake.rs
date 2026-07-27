@@ -10,6 +10,10 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::time::Duration;
+
+use crate::connection::Connection;
+use crate::process::BridgeError;
 
 /// MCP protocol version the gateway advertises.
 const PROTOCOL_VERSION: &str = "2025-03-26";
@@ -64,6 +68,39 @@ pub fn initialized_notification() -> Value {
 		"jsonrpc": "2.0",
 		"method": "notifications/initialized"
 	})
+}
+
+/// Perform the MCP initialize handshake over a [`Connection`].
+///
+/// Sends the `initialize` request through the id-correlated session,
+/// parses the response, then sends the `notifications/initialized`
+/// notification that completes the handshake. Routing through the
+/// connection means an unsolicited notification logged by the server
+/// before its `initialize` reply is skipped rather than mistaken for
+/// the reply.
+///
+/// # Errors
+///
+/// Returns [`BridgeError::HandshakeTimeout`] if the server does not
+/// answer within `handshake_timeout`, [`BridgeError::Handshake`] if
+/// the response is not a valid initialize result, and the underlying
+/// transport error if the connection fails.
+pub async fn perform(
+	connection: &Connection,
+	handshake_timeout: Duration,
+) -> Result<Handshake, BridgeError> {
+	let response = match connection
+		.send(&initialize_request(), handshake_timeout)
+		.await
+	{
+		Ok(response) => response,
+		Err(BridgeError::RequestTimeout) => return Err(BridgeError::HandshakeTimeout),
+		Err(other) => return Err(other),
+	};
+
+	let handshake = parse_initialize_response(&response)?;
+	connection.notify(&initialized_notification()).await?;
+	Ok(handshake)
 }
 
 /// Parse an initialize response and extract the handshake result.
@@ -207,5 +244,96 @@ mod tests {
 		let handshake = parse_initialize_response(&response).unwrap();
 		assert!(handshake.capabilities.as_object().unwrap().is_empty());
 		assert!(handshake.server_info.is_none());
+	}
+
+	/// A valid initialize result used by the handshake integration
+	/// tests, echoing the request's rewritten id.
+	fn initialize_result(request: &Value) -> Value {
+		serde_json::json!({
+			"jsonrpc": "2.0",
+			"id": request["id"],
+			"result": {
+				"protocolVersion": "2025-03-26",
+				"capabilities": {},
+				"serverInfo": {"name": "fake", "version": "1.0"},
+			},
+		})
+	}
+
+	/// Write a JSON value as a newline-terminated line to a stream.
+	async fn write_line<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W, value: &Value) {
+		use tokio::io::AsyncWriteExt;
+		let mut line = serde_json::to_string(value).unwrap();
+		line.push('\n');
+		writer.write_all(line.as_bytes()).await.unwrap();
+		writer.flush().await.unwrap();
+	}
+
+	/// The handshake completes even when the server logs an unsolicited
+	/// notification before its `initialize` response: the id-correlated
+	/// reader skips the notification rather than reading it as the reply.
+	#[tokio::test]
+	async fn handshake_succeeds_despite_leading_notification() {
+		use tokio::io::{AsyncBufReadExt, BufReader};
+
+		let (client_side, child_side) = tokio::io::duplex(8192);
+		let (client_read, client_write) = tokio::io::split(client_side);
+		let (child_read, mut child_write) = tokio::io::split(child_side);
+		let mut child_read = BufReader::new(child_read);
+
+		let child = tokio::spawn(async move {
+			write_line(
+				&mut child_write,
+				&serde_json::json!({"jsonrpc": "2.0", "method": "notifications/message"}),
+			)
+			.await;
+			let mut line = String::new();
+			child_read.read_line(&mut line).await.unwrap();
+			let request: Value = serde_json::from_str(line.trim()).unwrap();
+			write_line(&mut child_write, &initialize_result(&request)).await;
+			// Consume the trailing `initialized` notification so stdin
+			// stays open until the handshake completes, as a real
+			// server's would.
+			let mut trailing = String::new();
+			child_read.read_line(&mut trailing).await.unwrap();
+		});
+
+		let connection = Connection::open(client_read, client_write);
+		let handshake = perform(&connection, Duration::from_secs(5)).await.unwrap();
+		child.await.unwrap();
+
+		assert_eq!(handshake.protocol_version, "2025-03-26");
+		assert_eq!(handshake.server_info.unwrap().name, "fake");
+	}
+
+	/// The handshake sends `initialize` first and the
+	/// `notifications/initialized` notification second, in that order.
+	#[tokio::test]
+	async fn handshake_sends_initialize_then_initialized() {
+		use tokio::io::{AsyncBufReadExt, BufReader};
+
+		let (client_side, child_side) = tokio::io::duplex(8192);
+		let (client_read, client_write) = tokio::io::split(client_side);
+		let (child_read, mut child_write) = tokio::io::split(child_side);
+		let mut child_read = BufReader::new(child_read);
+
+		let child = tokio::spawn(async move {
+			let mut first = String::new();
+			child_read.read_line(&mut first).await.unwrap();
+			let request: Value = serde_json::from_str(first.trim()).unwrap();
+			write_line(&mut child_write, &initialize_result(&request)).await;
+
+			let mut second = String::new();
+			child_read.read_line(&mut second).await.unwrap();
+			let notification: Value = serde_json::from_str(second.trim()).unwrap();
+			(request, notification)
+		});
+
+		let connection = Connection::open(client_read, client_write);
+		perform(&connection, Duration::from_secs(5)).await.unwrap();
+
+		let (request, notification) = child.await.unwrap();
+		assert_eq!(request["method"], "initialize");
+		assert_eq!(notification["method"], "notifications/initialized");
 	}
 }

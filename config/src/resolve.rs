@@ -1,107 +1,89 @@
-//! Configuration resolution — inject credentials into server
+//! Configuration resolution: inject credentials into server
 //! definitions before the router sees them.
 //!
 //! This module transforms a `GatewayConfig` with named credential
 //! references into one where credential values have been resolved
 //! and injected into the appropriate transport fields (headers for
 //! HTTP, environment variables for stdio). The router and runtimes
-//! never know about credentials — they receive fully populated
+//! never know about credentials; they receive fully populated
 //! headers and env maps.
 
 use std::collections::HashMap;
 
-use crate::{GatewayConfig, ServerDefinition, Transport};
+use crate::{CredentialInjection, GatewayConfig, ServerDefinition, Transport};
 
-/// A function that resolves a credential name to its secret value.
+/// Translate every server's credential reference into use-time
+/// injection metadata.
 ///
-/// This is the only coupling point between the credential system
-/// and configuration. The daemon provides a closure that calls the
-/// credential provider; the config crate does not depend on the
-/// credentials crate.
-pub type CredentialResolver = Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
-
-/// Resolve all credential references in a gateway configuration.
+/// For each server whose `credential` field is set, this produces a
+/// [`CredentialInjection`] describing *how* the value will be applied
+/// to outgoing traffic (as an HTTP header for HTTP and SSE
+/// upstreams, or as the `MCP_CREDENTIAL` environment variable for
+/// stdio servers) and stores it on
+/// [`ServerDefinition::credential_injection`]. The credential value
+/// itself is **not** fetched here; that happens at use time through
+/// the resolver carried by the proxy and bridge runtimes. Operator
+/// supplied headers and environment entries are passed through
+/// untouched.
 ///
-/// For each server with a `credential` field:
-/// - **HTTP servers**: the resolved value is injected as a header
-///   using `credential_header` and `credential_prefix`
-/// - **Stdio servers**: the resolved value is injected as the
-///   `MCP_CREDENTIAL` environment variable
-///
-/// Returns a new config with credentials resolved and injected.
-/// Server definitions that have no credential are passed through
-/// unchanged.
-///
-/// # Errors
-///
-/// Returns an error if any referenced credential cannot be resolved.
-pub fn resolve_credentials(
-	config: &GatewayConfig,
-	resolver: &CredentialResolver,
-) -> Result<GatewayConfig, CredentialResolutionError> {
+/// Servers without a credential reference are returned unchanged.
+/// The function is infallible: producing metadata cannot fail, and
+/// any resolution errors that *would* surface at use time are
+/// reported by the resolver itself when the request is dispatched.
+#[must_use]
+pub fn resolve_credentials(config: &GatewayConfig) -> GatewayConfig {
 	let mut resolved_servers = HashMap::with_capacity(config.servers.len());
 
 	for (name, definition) in &config.servers {
-		let populated = resolve_server_credentials(name, definition, resolver)?;
-		resolved_servers.insert(name.clone(), populated);
+		resolved_servers.insert(name.clone(), populate_injection(definition));
 	}
 
-	Ok(GatewayConfig {
+	GatewayConfig {
 		servers: resolved_servers,
+		oauth: config.oauth.clone(),
 		trusted_proxies: config.trusted_proxies.clone(),
 		client_identity_headers: config.client_identity_headers.clone(),
 		max_body_bytes: config.max_body_bytes,
-	})
+		authentication: config.authentication.clone(),
+	}
 }
 
-fn resolve_server_credentials(
-	server_name: &str,
-	definition: &ServerDefinition,
-	resolver: &CredentialResolver,
-) -> Result<ServerDefinition, CredentialResolutionError> {
+/// Populate a server's `credential_injection` from its `credential`
+/// reference and clear the now-redundant marker.
+///
+/// The choice of injection variant follows the transport: HTTP and
+/// SSE upstreams take a `Header` injection (carrying the resolved
+/// header name and prefix so the proxy doesn't have to re-derive
+/// them at request time), and stdio servers take an `Env` injection.
+fn populate_injection(definition: &ServerDefinition) -> ServerDefinition {
 	let Some(credential_name) = &definition.credential else {
-		return Ok(definition.clone());
+		return definition.clone();
 	};
 
-	let secret_value = resolver(credential_name).map_err(|reason| CredentialResolutionError {
-		server: server_name.to_owned(),
-		credential: credential_name.clone(),
-		reason,
-	})?;
+	let injection = match &definition.transport {
+		Transport::Http { .. } => CredentialInjection::Header {
+			credential_name: credential_name.clone(),
+			header_name: definition.resolved_credential_header().to_owned(),
+			header_prefix: definition.resolved_credential_prefix().to_owned(),
+		},
+		#[cfg(feature = "sse")]
+		Transport::Sse { .. } => CredentialInjection::Header {
+			credential_name: credential_name.clone(),
+			header_name: definition.resolved_credential_header().to_owned(),
+			header_prefix: definition.resolved_credential_prefix().to_owned(),
+		},
+		Transport::Stdio { .. } => CredentialInjection::Env {
+			credential_name: credential_name.clone(),
+		},
+	};
 
 	let mut populated = definition.clone();
-
-	match &mut populated.transport {
-		Transport::Http { headers, .. } => {
-			let header_name = definition.resolved_credential_header().to_owned();
-			let header_value = format!(
-				"{}{}",
-				definition.resolved_credential_prefix(),
-				secret_value
-			);
-			headers.insert(header_name, header_value);
-		}
-		#[cfg(feature = "sse")]
-		Transport::Sse { headers, .. } => {
-			let header_name = definition.resolved_credential_header().to_owned();
-			let header_value = format!(
-				"{}{}",
-				definition.resolved_credential_prefix(),
-				secret_value
-			);
-			headers.insert(header_name, header_value);
-		}
-		Transport::Stdio { .. } => {
-			populated
-				.env
-				.insert("MCP_CREDENTIAL".to_owned(), secret_value);
-		}
-	}
-
-	// Clear the credential reference — it has been resolved.
+	populated.credential_injection = Some(injection);
+	// `credential_injection` is the canonical post-resolution view;
+	// clear the input marker so downstream code cannot accidentally
+	// re-read it.
 	populated.credential = None;
-
-	Ok(populated)
+	populated
 }
 
 /// A credential referenced by a server could not be resolved.
@@ -118,20 +100,18 @@ pub struct CredentialResolutionError {
 
 #[cfg(test)]
 mod tests {
+	use mcp_gateway_credentials::Secret;
+
+	use crate::CredentialInjection;
+
 	use super::*;
 
-	fn test_resolver() -> CredentialResolver {
-		Box::new(|name| match name {
-			"github-token" => Ok("ghp_test123".to_owned()),
-			"api-key" => Ok("sk-test456".to_owned()),
-			_ => Err(format!("not found: {name}")),
-		})
-	}
-
-	/// An HTTP server's credential is injected as an Authorization
-	/// header with Bearer prefix by default.
+	/// An HTTP server's credential is materialised as `Header`
+	/// injection metadata using the default `Authorization`/`Bearer `
+	/// settings. The headers map is left untouched; eager value
+	/// baking has been replaced by use-time resolution.
 	#[test]
-	fn http_credential_injected_as_bearer_header() {
+	fn http_credential_produces_header_injection_with_defaults() {
 		let config = GatewayConfig {
 			servers: [(
 				"github".to_owned(),
@@ -141,6 +121,8 @@ mod tests {
 					credential: Some("github-token".to_owned()),
 					credential_header: None,
 					credential_prefix: None,
+					request_timeout_seconds: None,
+					credential_injection: None,
 					transport: Transport::Http {
 						url: "https://api.github.com/mcp/".to_owned(),
 						headers: HashMap::new(),
@@ -151,27 +133,37 @@ mod tests {
 			..Default::default()
 		};
 
-		let resolved = resolve_credentials(&config, &test_resolver()).unwrap();
+		let resolved = resolve_credentials(&config);
 		let server = &resolved.servers["github"];
 
-		match &server.transport {
-			Transport::Http { headers, .. } => {
-				assert_eq!(
-					headers.get("Authorization").map(String::as_str),
-					Some("Bearer ghp_test123")
-				);
-			}
-			Transport::Stdio { .. } => panic!("expected HTTP transport"),
-		}
+		assert_eq!(
+			server.credential_injection,
+			Some(CredentialInjection::Header {
+				credential_name: "github-token".to_owned(),
+				header_name: "Authorization".to_owned(),
+				header_prefix: "Bearer ".to_owned(),
+			}),
+		);
 
-		// Credential reference is cleared after resolution.
-		assert!(server.credential.is_none());
+		let Transport::Http { headers, .. } = &server.transport else {
+			panic!("expected HTTP transport");
+		};
+		assert!(
+			headers.is_empty(),
+			"resolve_credentials must no longer eager-inject headers",
+		);
+
+		assert!(
+			server.credential.is_none(),
+			"the credential reference is consumed by resolution",
+		);
 	}
 
-	/// A custom credential header and empty prefix override the
-	/// default Authorization/Bearer behaviour.
+	/// A server's `credential_header` and `credential_prefix` flow
+	/// into the `Header` injection metadata so the use-time consumer
+	/// applies the operator-chosen header and prefix.
 	#[test]
-	fn custom_header_and_prefix() {
+	fn http_credential_carries_custom_header_and_prefix() {
 		let config = GatewayConfig {
 			servers: [(
 				"custom".to_owned(),
@@ -181,6 +173,8 @@ mod tests {
 					credential: Some("api-key".to_owned()),
 					credential_header: Some("X-Api-Key".to_owned()),
 					credential_prefix: Some(String::new()),
+					request_timeout_seconds: None,
+					credential_injection: None,
 					transport: Transport::Http {
 						url: "https://api.example.com/mcp/".to_owned(),
 						headers: HashMap::new(),
@@ -191,24 +185,24 @@ mod tests {
 			..Default::default()
 		};
 
-		let resolved = resolve_credentials(&config, &test_resolver()).unwrap();
+		let resolved = resolve_credentials(&config);
 		let server = &resolved.servers["custom"];
 
-		match &server.transport {
-			Transport::Http { headers, .. } => {
-				assert_eq!(
-					headers.get("X-Api-Key").map(String::as_str),
-					Some("sk-test456")
-				);
-			}
-			Transport::Stdio { .. } => panic!("expected HTTP transport"),
-		}
+		assert_eq!(
+			server.credential_injection,
+			Some(CredentialInjection::Header {
+				credential_name: "api-key".to_owned(),
+				header_name: "X-Api-Key".to_owned(),
+				header_prefix: String::new(),
+			}),
+		);
 	}
 
-	/// A stdio server's credential is injected as the
-	/// `MCP_CREDENTIAL` environment variable.
+	/// A stdio server's credential is materialised as `Env`
+	/// injection metadata. The `env` map is left untouched; the
+	/// bridge resolves the value at spawn time.
 	#[test]
-	fn stdio_credential_injected_as_env_var() {
+	fn stdio_credential_produces_env_injection() {
 		let config = GatewayConfig {
 			servers: [(
 				"local-server".to_owned(),
@@ -218,6 +212,8 @@ mod tests {
 					credential: Some("github-token".to_owned()),
 					credential_header: None,
 					credential_prefix: None,
+					request_timeout_seconds: None,
+					credential_injection: None,
 					transport: Transport::Stdio {
 						command: "mcp-server".to_owned(),
 						args: vec![],
@@ -228,30 +224,42 @@ mod tests {
 			..Default::default()
 		};
 
-		let resolved = resolve_credentials(&config, &test_resolver()).unwrap();
+		let resolved = resolve_credentials(&config);
 		let server = &resolved.servers["local-server"];
 
 		assert_eq!(
-			server.env.get("MCP_CREDENTIAL").map(String::as_str),
-			Some("ghp_test123")
+			server.credential_injection,
+			Some(CredentialInjection::Env {
+				credential_name: "github-token".to_owned(),
+			}),
+		);
+		assert!(
+			!server.env.contains_key("MCP_CREDENTIAL"),
+			"resolve_credentials must no longer eager-inject env vars",
 		);
 	}
 
-	/// Existing headers are preserved when a credential is injected.
+	/// Operator-supplied headers and env entries pass through
+	/// untouched; resolution only annotates injection metadata.
 	#[test]
-	fn existing_headers_preserved() {
+	fn operator_supplied_headers_and_env_pass_through_unchanged() {
 		let mut headers = HashMap::new();
-		headers.insert("X-Custom".to_owned(), "preserved".to_owned());
+		headers.insert("X-Custom".to_owned(), Secret::new("preserved".to_owned()));
+
+		let mut env = HashMap::new();
+		env.insert("LOG_LEVEL".to_owned(), Secret::new("debug".to_owned()));
 
 		let config = GatewayConfig {
 			servers: [(
 				"mixed".to_owned(),
 				ServerDefinition {
 					enabled: true,
-					env: HashMap::new(),
+					env,
 					credential: Some("github-token".to_owned()),
 					credential_header: None,
 					credential_prefix: None,
+					request_timeout_seconds: None,
+					credential_injection: None,
 					transport: Transport::Http {
 						url: "https://api.example.com/mcp/".to_owned(),
 						headers,
@@ -262,27 +270,28 @@ mod tests {
 			..Default::default()
 		};
 
-		let resolved = resolve_credentials(&config, &test_resolver()).unwrap();
+		let resolved = resolve_credentials(&config);
 		let server = &resolved.servers["mixed"];
 
-		match &server.transport {
-			Transport::Http { headers, .. } => {
-				assert_eq!(
-					headers.get("X-Custom").map(String::as_str),
-					Some("preserved")
-				);
-				assert_eq!(
-					headers.get("Authorization").map(String::as_str),
-					Some("Bearer ghp_test123")
-				);
-			}
-			Transport::Stdio { .. } => panic!("expected HTTP transport"),
-		}
+		let Transport::Http { headers, .. } = &server.transport else {
+			panic!("expected HTTP transport");
+		};
+		assert_eq!(
+			headers.get("X-Custom").map(Secret::expose),
+			Some("preserved"),
+		);
+		assert_eq!(headers.len(), 1, "no eager Authorization injection");
+
+		assert_eq!(
+			server.env.get("LOG_LEVEL").map(Secret::expose),
+			Some("debug"),
+		);
 	}
 
-	/// Servers without credentials pass through unchanged.
+	/// Servers without a credential reference receive `None`
+	/// injection metadata and are otherwise untouched.
 	#[test]
-	fn no_credential_passes_through() {
+	fn server_without_credential_has_no_injection() {
 		let config = GatewayConfig {
 			servers: [(
 				"public".to_owned(),
@@ -292,6 +301,8 @@ mod tests {
 					credential: None,
 					credential_header: None,
 					credential_prefix: None,
+					request_timeout_seconds: None,
+					credential_injection: None,
 					transport: Transport::Http {
 						url: "https://public.example.com/mcp/".to_owned(),
 						headers: HashMap::new(),
@@ -302,20 +313,20 @@ mod tests {
 			..Default::default()
 		};
 
-		let resolved = resolve_credentials(&config, &test_resolver()).unwrap();
+		let resolved = resolve_credentials(&config);
 		let server = &resolved.servers["public"];
 
-		match &server.transport {
-			Transport::Http { headers, .. } => {
-				assert!(headers.is_empty());
-			}
-			Transport::Stdio { .. } => panic!("expected HTTP transport"),
-		}
+		assert_eq!(server.credential_injection, None);
+		let Transport::Http { headers, .. } = &server.transport else {
+			panic!("expected HTTP transport");
+		};
+		assert!(headers.is_empty());
 	}
 
-	/// Multiple servers resolve their credentials independently.
+	/// Servers are resolved independently; each one's transport
+	/// kind drives its own injection variant.
 	#[test]
-	fn multiple_servers_resolve_independently() {
+	fn multiple_servers_each_get_their_own_injection() {
 		let config = GatewayConfig {
 			servers: [
 				(
@@ -326,6 +337,8 @@ mod tests {
 						credential: Some("github-token".to_owned()),
 						credential_header: None,
 						credential_prefix: None,
+						request_timeout_seconds: None,
+						credential_injection: None,
 						transport: Transport::Http {
 							url: "https://api.github.com/mcp/".to_owned(),
 							headers: HashMap::new(),
@@ -333,16 +346,18 @@ mod tests {
 					},
 				),
 				(
-					"custom".to_owned(),
+					"local".to_owned(),
 					ServerDefinition {
 						enabled: true,
 						env: HashMap::new(),
-						credential: Some("api-key".to_owned()),
-						credential_header: Some("X-Api-Key".to_owned()),
-						credential_prefix: Some(String::new()),
-						transport: Transport::Http {
-							url: "https://api.example.com/mcp/".to_owned(),
-							headers: HashMap::new(),
+						credential: Some("local-token".to_owned()),
+						credential_header: None,
+						credential_prefix: None,
+						request_timeout_seconds: None,
+						credential_injection: None,
+						transport: Transport::Stdio {
+							command: "mcp-local".to_owned(),
+							args: vec![],
 						},
 					},
 				),
@@ -351,44 +366,42 @@ mod tests {
 			..Default::default()
 		};
 
-		let resolved = resolve_credentials(&config, &test_resolver()).unwrap();
+		let resolved = resolve_credentials(&config);
 
-		match &resolved.servers["github"].transport {
-			Transport::Http { headers, .. } => {
-				assert_eq!(
-					headers.get("Authorization").map(String::as_str),
-					Some("Bearer ghp_test123")
-				);
-			}
-			Transport::Stdio { .. } => panic!("expected HTTP"),
-		}
-
-		match &resolved.servers["custom"].transport {
-			Transport::Http { headers, .. } => {
-				assert_eq!(
-					headers.get("X-Api-Key").map(String::as_str),
-					Some("sk-test456")
-				);
-			}
-			Transport::Stdio { .. } => panic!("expected HTTP"),
-		}
+		assert_eq!(
+			resolved.servers["github"].credential_injection,
+			Some(CredentialInjection::Header {
+				credential_name: "github-token".to_owned(),
+				header_name: "Authorization".to_owned(),
+				header_prefix: "Bearer ".to_owned(),
+			}),
+		);
+		assert_eq!(
+			resolved.servers["local"].credential_injection,
+			Some(CredentialInjection::Env {
+				credential_name: "local-token".to_owned(),
+			}),
+		);
 	}
 
-	/// An unresolvable credential produces a clear error
-	/// identifying the server and credential name.
+	/// An SSE server's credential is materialised as `Header`
+	/// injection metadata, mirroring the HTTP path.
+	#[cfg(feature = "sse")]
 	#[test]
-	fn unresolvable_credential_returns_error() {
+	fn sse_credential_produces_header_injection() {
 		let config = GatewayConfig {
 			servers: [(
-				"broken".to_owned(),
+				"streaming".to_owned(),
 				ServerDefinition {
 					enabled: true,
 					env: HashMap::new(),
-					credential: Some("missing-token".to_owned()),
+					credential: Some("sse-token".to_owned()),
 					credential_header: None,
 					credential_prefix: None,
-					transport: Transport::Http {
-						url: "https://api.example.com/mcp/".to_owned(),
+					request_timeout_seconds: None,
+					credential_injection: None,
+					transport: Transport::Sse {
+						url: "https://stream.example.com/mcp/".to_owned(),
 						headers: HashMap::new(),
 					},
 				},
@@ -397,8 +410,16 @@ mod tests {
 			..Default::default()
 		};
 
-		let error = resolve_credentials(&config, &test_resolver()).unwrap_err();
-		assert_eq!(error.server, "broken");
-		assert_eq!(error.credential, "missing-token");
+		let resolved = resolve_credentials(&config);
+		let server = &resolved.servers["streaming"];
+
+		assert_eq!(
+			server.credential_injection,
+			Some(CredentialInjection::Header {
+				credential_name: "sse-token".to_owned(),
+				header_name: "Authorization".to_owned(),
+				header_prefix: "Bearer ".to_owned(),
+			}),
+		);
 	}
 }

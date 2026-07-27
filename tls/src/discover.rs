@@ -50,18 +50,18 @@ pub enum CertificateSource {
 }
 
 impl std::fmt::Display for CertificateSource {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Self::Explicit { cert, .. } => {
-				write!(f, "explicit ({})", cert.display())
+				write!(formatter, "explicit ({})", cert.display())
 			}
 			Self::Conventional { cert, .. } => {
-				write!(f, "conventional ({})", cert.display())
+				write!(formatter, "conventional ({})", cert.display())
 			}
 			Self::Environment { cert, .. } => {
-				write!(f, "environment ({})", cert.display())
+				write!(formatter, "environment ({})", cert.display())
 			}
-			Self::SelfSigned => write!(f, "self-signed (ephemeral)"),
+			Self::SelfSigned => write!(formatter, "self-signed (ephemeral)"),
 		}
 	}
 }
@@ -183,7 +183,9 @@ fn build_server_config(
 	certs: Vec<CertificateDer<'static>>,
 	key: PrivateKeyDer<'static>,
 ) -> Result<ServerConfig, TlsError> {
-	ServerConfig::builder()
+	ServerConfig::builder_with_provider(mcp_gateway_crypto::provider())
+		.with_safe_default_protocol_versions()
+		.map_err(TlsError::Rustls)?
 		.with_no_client_auth()
 		.with_single_cert(certs, key)
 		.map_err(TlsError::Rustls)
@@ -235,7 +237,7 @@ mod tests {
 		assert!(matches!(result, Err(TlsError::FileRead { .. })));
 	}
 
-	/// Explicit paths require both cert and key — checked at the
+	/// Explicit paths require both cert and key, checked at the
 	/// `resolve` level, not here, but we test that `load_from_paths`
 	/// works with valid PEM files.
 	#[test]

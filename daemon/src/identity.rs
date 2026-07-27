@@ -3,7 +3,7 @@
 //! When the gateway runs behind a reverse proxy that terminates
 //! mTLS, the proxy verifies client certificates and forwards
 //! identity information via HTTP headers. This module provides
-//! middleware that extracts that identity — but only when the
+//! middleware that extracts that identity, but only when the
 //! request arrives from a trusted proxy address.
 //!
 //! Requests from untrusted sources have identity headers stripped

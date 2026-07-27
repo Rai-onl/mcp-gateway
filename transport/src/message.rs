@@ -1,8 +1,8 @@
 //! JSON-RPC 2.0 message classification.
 //!
 //! MCP uses JSON-RPC 2.0 as its wire format. The gateway needs to
-//! classify incoming messages without fully parsing their contents
-//! — it only needs to know whether a message is a request (has an
+//! classify incoming messages without fully parsing their contents.
+//! It only needs to know whether a message is a request (has an
 //! `id` field, expects a response) or a notification (no `id`,
 //! fire-and-forget).
 
@@ -13,13 +13,13 @@ use serde_json::Value;
 pub enum MessageKind {
 	/// A request with an `id` field that expects a response.
 	Request,
-	/// A notification without an `id` field — fire-and-forget.
+	/// A notification without an `id` field: fire-and-forget.
 	Notification,
 	/// The message could not be parsed as valid JSON, lacks
 	/// the required fields for a JSON-RPC message, or is a
 	/// batch (array) which the gateway does not support.
 	Malformed,
-	/// The message is a JSON array — a batch request per
+	/// The message is a JSON array: a batch request per
 	/// JSON-RPC 2.0 section 6. The gateway does not support
 	/// batch processing.
 	Batch,

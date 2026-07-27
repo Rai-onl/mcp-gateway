@@ -71,7 +71,24 @@ pub struct TlsOptions {
 /// Returns an error if a source is found but the certificates
 /// cannot be loaded (malformed PEM, wrong key type, etc.).
 pub fn resolve(options: &TlsOptions) -> Result<Option<TlsConfig>, TlsError> {
-	// 1. Explicit paths from CLI flags.
+	if let Some(config) = try_explicit_paths(options)? {
+		return Ok(Some(config));
+	}
+	if let Some(config) = try_conventional_paths()? {
+		return Ok(Some(config));
+	}
+	if let Some(config) = try_environment_paths()? {
+		return Ok(Some(config));
+	}
+	if options.self_signed {
+		return try_self_signed().map(Some);
+	}
+	Ok(None)
+}
+
+/// First step of the discovery chain: explicit paths supplied via
+/// the `--tls-cert` and `--tls-key` command-line flags.
+fn try_explicit_paths(options: &TlsOptions) -> Result<Option<TlsConfig>, TlsError> {
 	if let Some(cert_path) = &options.cert_path {
 		let key_path = options
 			.key_path
@@ -86,63 +103,72 @@ pub fn resolve(options: &TlsOptions) -> Result<Option<TlsConfig>, TlsError> {
 			},
 		}));
 	}
-
 	if options.key_path.is_some() {
 		return Err(TlsError::Configuration(
 			"--tls-key requires --tls-cert".to_owned(),
 		));
 	}
-
-	// 2. Conventional paths (~/.mcp/tls/).
-	if let Some((config, cert_path, key_path)) = discover::load_from_conventional_paths()? {
-		tracing::info!(
-			cert = %cert_path.display(),
-			key = %key_path.display(),
-			"discovered TLS certificates at conventional path"
-		);
-		return Ok(Some(TlsConfig {
-			server_config: Arc::new(config),
-			source: CertificateSource::Conventional {
-				cert: cert_path,
-				key: key_path,
-			},
-		}));
-	}
-
-	// 3. Environment variables.
-	if let Some((config, cert_path, key_path)) = discover::load_from_env()? {
-		tracing::info!(
-			cert = %cert_path.display(),
-			key = %key_path.display(),
-			"loaded TLS certificates from environment variables"
-		);
-		return Ok(Some(TlsConfig {
-			server_config: Arc::new(config),
-			source: CertificateSource::Environment {
-				cert: cert_path,
-				key: key_path,
-			},
-		}));
-	}
-
-	// 4. Self-signed generation (feature-gated).
-	if options.self_signed {
-		#[cfg(feature = "self-signed")]
-		{
-			let (config, source) = selfsigned::generate()?;
-			return Ok(Some(TlsConfig {
-				server_config: Arc::new(config),
-				source,
-			}));
-		}
-
-		#[cfg(not(feature = "self-signed"))]
-		return Err(TlsError::Configuration(
-			"--tls-self-signed requires the 'self-signed' feature".to_owned(),
-		));
-	}
-
 	Ok(None)
+}
+
+/// Second step of the discovery chain: conventional paths under
+/// `~/.mcp/tls/`.
+fn try_conventional_paths() -> Result<Option<TlsConfig>, TlsError> {
+	let Some((config, cert_path, key_path)) = discover::load_from_conventional_paths()? else {
+		return Ok(None);
+	};
+	tracing::info!(
+		cert = %cert_path.display(),
+		key = %key_path.display(),
+		"discovered TLS certificates at conventional path"
+	);
+	Ok(Some(TlsConfig {
+		server_config: Arc::new(config),
+		source: CertificateSource::Conventional {
+			cert: cert_path,
+			key: key_path,
+		},
+	}))
+}
+
+/// Third step of the discovery chain: paths supplied via
+/// environment variables.
+fn try_environment_paths() -> Result<Option<TlsConfig>, TlsError> {
+	let Some((config, cert_path, key_path)) = discover::load_from_env()? else {
+		return Ok(None);
+	};
+	tracing::info!(
+		cert = %cert_path.display(),
+		key = %key_path.display(),
+		"loaded TLS certificates from environment variables"
+	);
+	Ok(Some(TlsConfig {
+		server_config: Arc::new(config),
+		source: CertificateSource::Environment {
+			cert: cert_path,
+			key: key_path,
+		},
+	}))
+}
+
+/// Fourth step of the discovery chain: ephemeral self-signed
+/// certificate generation, gated by the `self-signed` feature.
+fn try_self_signed() -> Result<TlsConfig, TlsError> {
+	#[cfg(feature = "self-signed")]
+	{
+		let (config, source) = selfsigned::generate()?;
+		Ok(TlsConfig {
+			server_config: Arc::new(config),
+			source,
+		})
+	}
+
+	#[cfg(not(feature = "self-signed"))]
+	{
+		Err(TlsError::Configuration(
+			"--tls-self-signed requires the 'self-signed' feature".to_owned(),
+		))
+	}
 }
 
 /// Errors from TLS certificate resolution.

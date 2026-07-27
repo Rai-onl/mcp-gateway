@@ -31,6 +31,10 @@ async fn start_gateway(
 	tokio::sync::oneshot::Sender<()>,
 	tokio::task::JoinHandle<()>,
 ) {
+	// The tests connect with a reqwest client that carries no bundled
+	// crypto provider, so install the process default first.
+	mcp_gateway_crypto::install();
+
 	let state = Arc::new(AppState::new(config, None).unwrap());
 	let application = build_app(&state);
 
@@ -83,6 +87,8 @@ fn test_config() -> GatewayConfig {
 				credential: None,
 				credential_header: None,
 				credential_prefix: None,
+				request_timeout_seconds: None,
+				credential_injection: None,
 				transport: Transport::Stdio {
 					command: test_server_path,
 					args: vec![],

@@ -22,6 +22,40 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for individual POST requests to the message endpoint.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Process a single event from the SSE stream while waiting for the
+/// server's `endpoint` announcement.
+///
+/// Returns `Ok(Some(endpoint_url))` once the endpoint event arrives,
+/// `Ok(None)` for non-terminal events (the connection opened, or a
+/// non-endpoint message landed), and `Err` on a stream error or a
+/// stream that ended before the endpoint event arrived.
+///
+/// Extracted from the connect loop so the loop body stays shallow
+/// enough to satisfy the workspace's nesting threshold; the original
+/// inline match nested an `if` inside an `Ok(Message)` arm inside a
+/// `tokio::select` arm inside a `loop`.
+fn handle_endpoint_event(
+	sse_url: &str,
+	event_source: &mut EventSource,
+	event: Option<Result<Event, reqwest_eventsource::Error>>,
+) -> Result<Option<String>, SseError> {
+	match event {
+		Some(Ok(Event::Open)) => {
+			tracing::debug!(url = %sse_url, "SSE connection opened");
+			Ok(None)
+		}
+		Some(Ok(Event::Message(message))) if message.event == "endpoint" => {
+			event_source.close();
+			Ok(Some(message.data))
+		}
+		Some(Ok(Event::Message(_))) => Ok(None),
+		Some(Err(error)) => Err(SseError::Connection(error.to_string())),
+		None => Err(SseError::Connection(
+			"SSE stream ended before endpoint event".into(),
+		)),
+	}
+}
+
 /// Client for upstream MCP servers using the legacy HTTP+SSE transport.
 #[derive(Debug)]
 pub struct SseClient {
@@ -99,29 +133,10 @@ impl SseClient {
 		let mut event_source =
 			EventSource::new(request).map_err(|error| SseError::Connection(error.to_string()))?;
 
-		let endpoint = tokio::time::timeout(CONNECT_TIMEOUT, async {
-			loop {
-				match event_source.next().await {
-					Some(Ok(Event::Open)) => {
-						tracing::debug!(url = %self.sse_url, "SSE connection opened");
-					}
-					Some(Ok(Event::Message(message))) => {
-						if message.event == "endpoint" {
-							event_source.close();
-							return Ok(message.data);
-						}
-					}
-					Some(Err(error)) => {
-						return Err(SseError::Connection(error.to_string()));
-					}
-					None => {
-						return Err(SseError::Connection(
-							"SSE stream ended before endpoint event".into(),
-						));
-					}
-				}
-			}
-		})
+		let endpoint = tokio::time::timeout(
+			CONNECT_TIMEOUT,
+			self.await_endpoint_announcement(&mut event_source),
+		)
 		.await
 		.map_err(|_| SseError::Connection("timed out waiting for endpoint event".into()))??;
 
@@ -133,6 +148,27 @@ impl SseClient {
 
 		*self.message_endpoint.write().await = Some(endpoint);
 		Ok(())
+	}
+
+	/// Drive the SSE stream until the server announces the message
+	/// endpoint URL.
+	///
+	/// Loops over events until [`handle_endpoint_event`] returns
+	/// the endpoint data, propagating any stream error or premature
+	/// stream end. Extracted from `connect` so the timeout wrapper
+	/// stays a single expression and the loop body stays shallow.
+	async fn await_endpoint_announcement(
+		&self,
+		event_source: &mut EventSource,
+	) -> Result<String, SseError> {
+		loop {
+			let next_event = event_source.next().await;
+			if let Some(endpoint_data) =
+				handle_endpoint_event(&self.sse_url, event_source, next_event)?
+			{
+				return Ok(endpoint_data);
+			}
+		}
 	}
 
 	/// Forward an MCP message to the upstream server via POST.
@@ -186,8 +222,8 @@ pub enum SseError {
 	#[error("SSE connection failed: {0}")]
 	Connection(String),
 
-	/// The client has not connected yet—call `connect()` first.
-	#[error("not connected—call connect() before forwarding")]
+	/// The client has not connected yet; call `connect()` first.
+	#[error("not connected: call connect() before forwarding")]
 	NotConnected,
 
 	/// The POST request to the message endpoint failed.

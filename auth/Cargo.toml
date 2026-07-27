@@ -1,0 +1,82 @@
+[package]
+name = "mcp-gateway-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Inbound OAuth 2.1 resource-server behaviour for the MCP gateway"
+
+[lints]
+workspace = true
+
+[features]
+default = ["ring"]
+# Provider flavour, forwarded to the shared selector crate. This crate
+# builds a client config with the selected provider but enables no
+# rustls provider feature of its own.
+ring = ["mcp-gateway-crypto/ring"]
+aws-lc-rs = ["mcp-gateway-crypto/aws-lc-rs"]
+fips = ["mcp-gateway-crypto/fips"]
+
+[dependencies]
+mcp-gateway-config = { workspace = true }
+# Selects the rustls cryptographic provider for the SPKI-pinning client
+# config; the flavour is chosen by the binary and forwarded here.
+mcp-gateway-crypto = { workspace = true }
+# Resolves the introspection client secret through the established
+# credential chain, inheriting its mlock and zeroisation guarantees.
+mcp-gateway-credentials = { workspace = true }
+# axum for the authentication middleware and the CORS layer it
+# composes alongside; tower-http supplies the CORS implementation.
+axum = { workspace = true }
+tower-http = { workspace = true }
+# The auth crate pins authorisation-server TLS certificates by SPKI,
+# which needs a custom rustls verifier installed via reqwest's
+# `use_preconfigured_tls`. That path requires the rustls backend, so
+# this crate configures reqwest directly (default-features off to drop
+# the native-tls backend the rest of the workspace uses) rather than
+# inheriting the workspace default.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+# rustls for the custom SPKI certificate verifier. The provider comes
+# from mcp-gateway-crypto, so no provider feature is set here.
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+base64 = { workspace = true }
+# JWT signature verification and decoding, backed by ring for
+# constant-time signature comparison across the RSA and ECDSA
+# families the gateway accepts.
+jsonwebtoken = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+# Parses the leaf certificate to extract its SubjectPublicKeyInfo for
+# SPKI pin comparison.
+x509-parser = { workspace = true }
+
+[dev-dependencies]
+# Installs the selected crypto provider so integration tests that build
+# their own HTTPS client (against the fixture) have a process default.
+mcp-gateway-crypto = { workspace = true }
+# The inbound-auth slices integration-test against a stub
+# authorisation server. Rather than hand-roll one, the gateway
+# consumes Sinetti's `mockoidc-kit` (issue #33): a published,
+# embeddable OIDC issuer with ES256 signing, key rotation, and the
+# `control` test affordances (outage injection, discovery
+# tampering, request synchronisation) the later slices need. Pinned
+# to the signed `v0.0.5` tag. The `control` feature gates the
+# native-only test levers; it is dev-only and never reaches the
+# gateway binary.
+mockoidc-kit = { git = "https://github.com/sinetti-dev/mockoidc-rs", tag = "v0.0.5", features = ["control", "tls"] }
+# Captures `warn`-level events in tests that assert load-time
+# diagnostics (the RFC 8707 advisory) are emitted.
+tracing-subscriber = { workspace = true }
+# Generates the self-signed certificate the SPKI-pinning tests serve
+# from the fixture's TLS mode and pin against.
+rcgen = { workspace = true }
+# Drives the authentication middleware through a test axum app:
+# `tower`'s `ServiceExt::oneshot` sends a request, `http-body-util`
+# reads the response body.
+tower = { workspace = true }
+http-body-util = { workspace = true }

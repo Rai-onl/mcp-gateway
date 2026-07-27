@@ -1,0 +1,13 @@
+cognitive-complexity-threshold = 10
+excessive-nesting-threshold = 4
+too-many-arguments-threshold = 5
+too-many-lines-threshold = 60
+type-complexity-threshold = 200
+single-char-binding-names-threshold = 0
+
+# Identifiers `doc_markdown` must not flag for missing backticks.
+# `..` keeps clippy's built-in list (which already covers OAuth,
+# OpenSSL, and similar). OpenID is a standards term that recurs
+# throughout the inbound-auth surface; it is prose, not code, so it
+# is listed here rather than backticked at every mention.
+doc-valid-idents = ["OpenID", "SubjectPublicKeyInfo", "DPoP", ".."]

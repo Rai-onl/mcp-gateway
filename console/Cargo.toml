@@ -11,8 +11,31 @@ name = "mcp"
 path = "src/main.rs"
 
 [features]
-default = ["self-signed"]
+default = ["self-signed", "ring"]
 self-signed = ["mcp-gateway-tls/self-signed"]
+# Crypto provider flavour. The binary is the one place that picks it,
+# fanning the choice out to every crate that touches rustls. Build a
+# non-default flavour with, for example:
+#   cargo build -p mcp-gateway-console --no-default-features \
+#     --features "self-signed,aws-lc-rs"
+ring = [
+	"mcp-gateway-crypto/ring",
+	"mcp-gateway-tls/ring",
+	"mcp-gateway-auth/ring",
+	"mcp-gateway-daemon/ring",
+]
+aws-lc-rs = [
+	"mcp-gateway-crypto/aws-lc-rs",
+	"mcp-gateway-tls/aws-lc-rs",
+	"mcp-gateway-auth/aws-lc-rs",
+	"mcp-gateway-daemon/aws-lc-rs",
+]
+fips = [
+	"mcp-gateway-crypto/fips",
+	"mcp-gateway-tls/fips",
+	"mcp-gateway-auth/fips",
+	"mcp-gateway-daemon/fips",
+]
 
 [lints]
 workspace = true
@@ -20,15 +43,26 @@ workspace = true
 [dependencies]
 axum = { workspace = true }
 clap = { workspace = true }
+humantime = { workspace = true }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+mcp-gateway-auth = { workspace = true }
 mcp-gateway-config = { workspace = true }
 mcp-gateway-credentials = { workspace = true }
+mcp-gateway-crypto = { workspace = true }
 mcp-gateway-daemon = { workspace = true }
 mcp-gateway-output = { workspace = true }
 mcp-gateway-tls = { workspace = true }
+reqwest = { workspace = true }
+rlimit = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tower = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+http-body-util = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tower = { workspace = true }

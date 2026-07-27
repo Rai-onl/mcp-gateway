@@ -22,6 +22,7 @@ mod tests {
 	/// An SSE client stores the configured SSE endpoint URL.
 	#[test]
 	fn client_stores_sse_url() {
+		mcp_gateway_crypto::install();
 		let client = SseClient::new(
 			"https://old.example.com/sse".into(),
 			std::collections::HashMap::new(),
@@ -36,6 +37,7 @@ mod tests {
 		let mut headers = std::collections::HashMap::new();
 		headers.insert("Authorization".into(), "Bearer token".into());
 
+		mcp_gateway_crypto::install();
 		let client = SseClient::new("https://old.example.com/sse".into(), headers);
 		assert_eq!(client.sse_url(), "https://old.example.com/sse");
 	}
@@ -43,6 +45,7 @@ mod tests {
 	/// Connecting to an unreachable SSE endpoint produces an error.
 	#[tokio::test]
 	async fn connect_to_unreachable_host_fails() {
+		mcp_gateway_crypto::install();
 		let client = SseClient::new(
 			"http://192.0.2.1:1/sse".into(),
 			std::collections::HashMap::new(),
@@ -59,6 +62,7 @@ mod tests {
 	/// endpoint yet produces a not-connected error.
 	#[tokio::test]
 	async fn forward_without_connect_fails() {
+		mcp_gateway_crypto::install();
 		let client = SseClient::new(
 			"http://192.0.2.1:1/sse".into(),
 			std::collections::HashMap::new(),

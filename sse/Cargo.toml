@@ -11,13 +11,24 @@ workspace = true
 
 [dependencies]
 # Pinned to reqwest 0.12 because reqwest-eventsource 0.6 is not
-# compatible with reqwest 0.13. This pulls a second copy of reqwest
-# into the binary. Upgrade when reqwest-eventsource releases a
-# 0.13-compatible version.
-reqwest = { version = "0.12", features = ["json"] }
+# compatible with reqwest 0.13. Upgrade when reqwest-eventsource
+# releases a 0.13-compatible version. No bundled crypto provider: the
+# provider is chosen by mcp-gateway-crypto and installed as the process
+# default, matching every other reqwest in the workspace. Roots come
+# from the OS trust store (native-roots) to match the platform-verifier
+# used by the workspace's reqwest 0.13 clients, so an SSE upstream behind
+# an internal certificate authority validates the same on every transport.
+reqwest = { version = "0.12", default-features = false, features = ["json", "charset", "http2", "system-proxy", "rustls-tls-native-roots-no-provider"] }
 reqwest-eventsource = "0.6"
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = "0.1"
 tracing = { workspace = true }
+
+[dev-dependencies]
+# Installs a crypto provider so tests that build an `SseClient` (which
+# builds a reqwest client with no bundled provider) have a process
+# default. `ring` is a test-only choice; the binary selects the real
+# provider.
+mcp-gateway-crypto = { workspace = true, features = ["ring"] }

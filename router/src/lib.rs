@@ -2,22 +2,39 @@
 //!
 //! The router maps server names to their runtime backends
 //! (stdio bridge or HTTP proxy) and dispatches incoming MCP
-//! messages to the correct one. It owns the runtime lifecycle
-//! — starting bridges and proxies from configuration.
+//! messages to the correct one. It owns the runtime lifecycle,
+//! starting bridges and proxies from configuration.
 
 mod dispatch;
 
-pub use dispatch::{Router, RouterError, RouterResponse};
+pub use dispatch::{Router, RouterError, RouterResponse, UpstreamFailure};
 
 #[cfg(test)]
 mod tests {
 	use std::collections::HashMap;
+	use std::sync::Arc;
 
 	use mcp_gateway_config::{GatewayConfig, ServerDefinition, Transport};
+	use mcp_gateway_credentials::{CredentialResolver, StaticResolver};
 
 	use super::*;
 
+	/// Build a no-op resolver for tests that exercise routing
+	/// surfaces unrelated to credential injection. The empty
+	/// `StaticResolver` will fail any actual `resolve` call but
+	/// these tests never trigger one.
+	fn empty_resolver() -> Arc<dyn CredentialResolver> {
+		Arc::new(StaticResolver::default())
+	}
+
+	/// Build a configuration with a stdio, an HTTP, and a disabled
+	/// server, covering the router's transport dispatch surface.
 	fn test_config() -> GatewayConfig {
+		// Building the HTTP server's proxy eagerly constructs a reqwest
+		// client with no bundled provider, so install the process
+		// default first.
+		mcp_gateway_crypto::install();
+
 		let mut servers = HashMap::new();
 
 		servers.insert(
@@ -28,6 +45,8 @@ mod tests {
 				credential: None,
 				credential_header: None,
 				credential_prefix: None,
+				request_timeout_seconds: None,
+				credential_injection: None,
 				transport: Transport::Stdio {
 					command: "cat".into(),
 					args: vec![],
@@ -43,6 +62,8 @@ mod tests {
 				credential: None,
 				credential_header: None,
 				credential_prefix: None,
+				request_timeout_seconds: None,
+				credential_injection: None,
 				transport: Transport::Http {
 					url: "https://api.example.com/mcp/".into(),
 					headers: HashMap::new(),
@@ -58,6 +79,8 @@ mod tests {
 				credential: None,
 				credential_header: None,
 				credential_prefix: None,
+				request_timeout_seconds: None,
+				credential_injection: None,
 				transport: Transport::Stdio {
 					command: "echo".into(),
 					args: vec![],
@@ -76,7 +99,7 @@ mod tests {
 	#[test]
 	fn router_lists_enabled_servers() {
 		let config = test_config();
-		let router = Router::from_config(&config).unwrap();
+		let router = Router::from_config(&config, empty_resolver()).unwrap();
 
 		let names = router.server_names();
 		assert!(names.contains(&"filesystem"));
@@ -88,7 +111,7 @@ mod tests {
 	#[tokio::test]
 	async fn unknown_server_returns_not_found() {
 		let config = test_config();
-		let router = Router::from_config(&config).unwrap();
+		let router = Router::from_config(&config, empty_resolver()).unwrap();
 
 		let message = serde_json::json!({
 			"jsonrpc": "2.0",
@@ -108,7 +131,7 @@ mod tests {
 	#[tokio::test]
 	async fn disabled_server_returns_not_found() {
 		let config = test_config();
-		let router = Router::from_config(&config).unwrap();
+		let router = Router::from_config(&config, empty_resolver()).unwrap();
 
 		let message = serde_json::json!({
 			"jsonrpc": "2.0",
@@ -121,5 +144,18 @@ mod tests {
 			.await
 			.expect_err("disabled server should return not-found");
 		assert!(matches!(error, RouterError::ServerNotFound(_)));
+	}
+
+	/// `is_bridge_timeout` marks a wedged backend (a request or handshake
+	/// timeout) but not a dead one or a non-bridge error, so the daemon
+	/// can map the former to 504 and the latter to 502.
+	#[test]
+	fn is_bridge_timeout_marks_only_wedged_bridges() {
+		use mcp_gateway_bridge::BridgeError;
+
+		assert!(RouterError::Bridge(BridgeError::RequestTimeout).is_bridge_timeout());
+		assert!(RouterError::Bridge(BridgeError::HandshakeTimeout).is_bridge_timeout());
+		assert!(!RouterError::Bridge(BridgeError::ProcessExited).is_bridge_timeout());
+		assert!(!RouterError::ServerNotFound("whatever".to_owned()).is_bridge_timeout());
 	}
 }

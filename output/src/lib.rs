@@ -3,7 +3,7 @@
 //! Console commands produce results that must be consumable by both
 //! humans at a terminal and machines parsing JSON. The [`Renderer`]
 //! centralises this concern so that command handlers remain
-//! format-agnostic — they write human text via a closure and return
+//! format-agnostic: they write human text via a closure and return
 //! a serialisable payload, and the renderer decides which channel
 //! to use based on the active [`OutputMode`].
 //!
@@ -190,7 +190,7 @@ impl Renderer {
 	/// `error:` prefix. In JSON mode the error is wrapped in
 	/// `{"ok": false, "error": {...}}` on stdout.
 	///
-	/// Errors are never suppressed by quiet mode — they always
+	/// Errors are never suppressed by quiet mode: they always
 	/// reach the operator.
 	pub fn error(&self, error: &impl Display, code: i32) {
 		match self.mode {

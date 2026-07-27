@@ -10,6 +10,8 @@
 //! from forwarded headers (RFC 9440).
 
 pub mod identity;
+mod refresh;
 mod server;
 
+pub use refresh::{run_discovery_refresh, run_key_refresh};
 pub use server::{AppState, AppStateError, build_app};

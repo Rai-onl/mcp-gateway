@@ -2,13 +2,17 @@
 //!
 //! Each server in the gateway configuration has a transport type
 //! that determines how the gateway connects to it. The transport
-//! field acts as a tagged-union discriminator — transport-specific
+//! field acts as a tagged-union discriminator: transport-specific
 //! fields are only valid for their respective transport type.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use ipnet::IpNet;
+use mcp_gateway_credentials::Secret;
 use serde::{Deserialize, Serialize};
+
+use crate::authentication::AuthenticationConfig;
 
 /// Top-level gateway configuration loaded from a JSON file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -16,6 +20,20 @@ pub struct GatewayConfig {
 	/// Named server definitions keyed by server name.
 	#[serde(default)]
 	pub servers: HashMap<String, ServerDefinition>,
+
+	/// Named OAuth credentials keyed by credential name.
+	///
+	/// A server's `credential` field may reference a name in this
+	/// map instead of a static credential. When it does, the
+	/// gateway acquires tokens from the configured authorisation
+	/// server at request time and injects them as `Authorization`
+	/// headers (or whatever the server's `credential_header`
+	/// resolves to). The client secret itself is resolved through
+	/// the existing static credential chain; operators reference
+	/// it by name via [`OAuthCredential::client_secret_credential`]
+	/// rather than embedding it in the configuration file.
+	#[serde(default, skip_serializing_if = "HashMap::is_empty")]
+	pub oauth: HashMap<String, OAuthCredential>,
 
 	/// CIDR ranges of trusted reverse proxies.
 	///
@@ -44,6 +62,17 @@ pub struct GatewayConfig {
 	/// Defaults to 4 MiB (4,194,304 bytes) if not specified.
 	#[serde(default = "default_max_body_bytes")]
 	pub max_body_bytes: usize,
+
+	/// Inbound authentication policy.
+	///
+	/// Absent in local-loopback deployments: the gateway accepts
+	/// every reachable request as today. Present in hosted
+	/// deployments: the gateway becomes a standards-conformant
+	/// OAuth 2.1 resource server, validates bearer tokens against
+	/// the configured authorisation server, and enforces per-server
+	/// scope authorisation.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub authentication: Option<AuthenticationConfig>,
 }
 
 /// Default maximum body size: 4 MiB.
@@ -55,11 +84,49 @@ impl Default for GatewayConfig {
 	fn default() -> Self {
 		Self {
 			servers: HashMap::new(),
+			oauth: HashMap::new(),
 			trusted_proxies: Vec::new(),
 			client_identity_headers: None,
 			max_body_bytes: default_max_body_bytes(),
+			authentication: None,
 		}
 	}
+}
+
+/// An OAuth `client_credentials` credential definition.
+///
+/// Operators declare these in the top-level `oauth` map of the
+/// configuration. A server entry whose `credential` field names one
+/// of these triggers per-request token acquisition rather than the
+/// static credential resolution path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OAuthCredential {
+	/// Full URL of the OAuth token endpoint to call.
+	pub token_endpoint: String,
+
+	/// OAuth `client_id` registered with the authorisation server.
+	pub client_id: String,
+
+	/// Name of a static credential (resolved through the existing
+	/// chain: file, command, environment) holding the OAuth
+	/// `client_secret`. Referenced by name so the secret can rotate
+	/// independently of this configuration file.
+	pub client_secret_credential: String,
+
+	/// Optional `scope` parameter sent to the token endpoint.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub scope: Option<String>,
+
+	/// Optional `audience` parameter sent to the token endpoint.
+	/// Required by some authorisation servers (e.g. Auth0).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub audience: Option<String>,
+
+	/// How long before the issued `expires_in` to refresh the
+	/// cached token. Accepts humantime values such as `30s` or
+	/// `2m`. Defaults to thirty seconds when absent.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub refresh_skew: Option<String>,
 }
 
 /// Header names for client identity forwarded by a reverse proxy.
@@ -110,8 +177,13 @@ pub struct ServerDefinition {
 	pub enabled: bool,
 
 	/// Environment variables injected into stdio server processes.
+	///
+	/// Values are stored as [`Secret`] so that credential-derived
+	/// entries (and any operator-supplied secrets that happen to live
+	/// alongside them) are zeroized when the configuration is dropped
+	/// or superseded by a reload.
 	#[serde(default, skip_serializing_if = "HashMap::is_empty")]
-	pub env: HashMap<String, String>,
+	pub env: HashMap<String, Secret>,
 
 	/// Named credential resolved via the credential provider chain.
 	///
@@ -138,9 +210,57 @@ pub struct ServerDefinition {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub credential_prefix: Option<String>,
 
+	/// Per-request timeout for a stdio bridge, in seconds. A tool call
+	/// that runs longer than this is treated as a wedged server, so the
+	/// bridge is torn down and replaced. Omitted means the 30-second
+	/// default; raise it for servers with legitimately long-running
+	/// operations. Ignored for HTTP servers.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub request_timeout_seconds: Option<u64>,
+
 	/// Transport-specific connection configuration.
 	#[serde(flatten)]
 	pub transport: Transport,
+
+	/// Resolved credential injection metadata.
+	///
+	/// Populated by [`resolve_credentials`](crate::resolve_credentials)
+	/// from the [`ServerDefinition::credential`] field; operators never
+	/// write this directly. It tells the consumer (proxy or bridge) how
+	/// to apply the credential at use time: as an HTTP header on
+	/// request dispatch, or as an environment variable at process spawn.
+	/// `None` means the server has no credential reference.
+	#[serde(skip)]
+	pub credential_injection: Option<CredentialInjection>,
+}
+
+/// How a credential value should be applied to a server's outgoing
+/// traffic, derived once at configuration resolution and consumed at
+/// use time by the proxy or bridge runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialInjection {
+	/// Apply as an HTTP header on every outgoing request to an HTTP
+	/// or SSE upstream. The header name and prefix come from the
+	/// server's `credential_header` and `credential_prefix` fields
+	/// (or their defaults of `Authorization` and `Bearer `).
+	Header {
+		/// The credential name to resolve through the resolver.
+		credential_name: String,
+		/// HTTP header name to set on the outgoing request.
+		header_name: String,
+		/// String prepended to the resolved value before the header
+		/// is built (e.g. `Bearer ` for an OAuth bearer token).
+		header_prefix: String,
+	},
+
+	/// Apply as the `MCP_CREDENTIAL` environment variable when the
+	/// stdio bridge spawns the child process. Resolution happens at
+	/// spawn; the resulting value lives inside the child for its
+	/// lifetime, and refresh requires bridge restart.
+	Env {
+		/// The credential name to resolve through the resolver.
+		credential_name: String,
+	},
 }
 
 impl ServerDefinition {
@@ -157,7 +277,29 @@ impl ServerDefinition {
 	pub fn resolved_credential_prefix(&self) -> &str {
 		self.credential_prefix.as_deref().unwrap_or("Bearer ")
 	}
+
+	/// The effective per-request timeout for this server's stdio
+	/// bridge, applying the default when unset.
+	#[must_use]
+	pub fn request_timeout(&self) -> Duration {
+		Duration::from_secs(
+			self.request_timeout_seconds
+				.unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECONDS),
+		)
+	}
 }
+
+/// Default per-request timeout for a stdio bridge, in seconds, applied
+/// when a server definition does not set `request_timeout_seconds`.
+const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
+
+/// Upper bound for a configured per-request timeout, in seconds. A value
+/// above this is almost certainly a units mistake, such as milliseconds
+/// written as seconds, and would let a single wedged request hang its
+/// client for far longer than this feature is meant to permit, so it is
+/// rejected at validation time. One hour is generous for any legitimate
+/// tool call.
+pub(crate) const MAX_REQUEST_TIMEOUT_SECONDS: u64 = 3600;
 
 /// Transport-specific connection configuration.
 ///
@@ -183,9 +325,11 @@ pub enum Transport {
 		url: String,
 
 		/// HTTP headers sent with each request. Values may contain
-		/// `${VAR}` placeholders resolved at runtime.
+		/// `${VAR}` placeholders resolved at runtime. Stored as
+		/// [`Secret`] so credential-derived header values are
+		/// zeroized when the configuration is dropped.
 		#[serde(default, skip_serializing_if = "HashMap::is_empty")]
-		headers: HashMap<String, String>,
+		headers: HashMap<String, Secret>,
 	},
 
 	/// Connect to a remote MCP server via the legacy HTTP+SSE
@@ -197,9 +341,11 @@ pub enum Transport {
 		url: String,
 
 		/// HTTP headers sent with both the SSE connection and
-		/// POST requests to the message endpoint.
+		/// POST requests to the message endpoint. Stored as
+		/// [`Secret`] for the same reason as
+		/// [`Transport::Http::headers`].
 		#[serde(default, skip_serializing_if = "HashMap::is_empty")]
-		headers: HashMap<String, String>,
+		headers: HashMap<String, Secret>,
 	},
 }
 
@@ -246,7 +392,7 @@ mod tests {
 			def.transport,
 			Transport::Http { ref url, ref headers }
 			if url == "https://api.example.com/mcp/"
-				&& headers.get("Authorization").map(String::as_str)
+				&& headers.get("Authorization").map(Secret::expose)
 					== Some("Bearer ${API_TOKEN}")
 		));
 	}
@@ -258,6 +404,25 @@ mod tests {
 		let json = r#"{"transport": "stdio", "command": "cat"}"#;
 		let def: ServerDefinition = serde_json::from_str(json).unwrap();
 		assert!(def.enabled);
+	}
+
+	/// An omitted `request_timeout_seconds` applies the 30-second
+	/// default through the `request_timeout` accessor.
+	#[test]
+	fn request_timeout_defaults_to_thirty_seconds() {
+		let json = r#"{"transport": "stdio", "command": "cat"}"#;
+		let def: ServerDefinition = serde_json::from_str(json).unwrap();
+		assert!(def.request_timeout_seconds.is_none());
+		assert_eq!(def.request_timeout(), Duration::from_secs(30));
+	}
+
+	/// A configured `request_timeout_seconds` overrides the default.
+	#[test]
+	fn request_timeout_uses_configured_value() {
+		let json = r#"{"transport": "stdio", "command": "cat", "request_timeout_seconds": 45}"#;
+		let def: ServerDefinition = serde_json::from_str(json).unwrap();
+		assert_eq!(def.request_timeout_seconds, Some(45));
+		assert_eq!(def.request_timeout(), Duration::from_secs(45));
 	}
 
 	/// An explicitly disabled server preserves its state through
@@ -283,15 +448,25 @@ mod tests {
 			"env": {"LOG_LEVEL": "debug", "API_KEY": "${SECRET}"}
 		}"#;
 		let def: ServerDefinition = serde_json::from_str(json).unwrap();
-		assert_eq!(def.env.get("LOG_LEVEL").map(String::as_str), Some("debug"));
+		assert_eq!(def.env.get("LOG_LEVEL").map(Secret::expose), Some("debug"));
 		assert_eq!(
-			def.env.get("API_KEY").map(String::as_str),
+			def.env.get("API_KEY").map(Secret::expose),
 			Some("${SECRET}")
 		);
 
 		let serialised = serde_json::to_string(&def).unwrap();
 		let reloaded: ServerDefinition = serde_json::from_str(&serialised).unwrap();
-		assert_eq!(reloaded.env, def.env);
+		assert_eq!(
+			reloaded.env.len(),
+			def.env.len(),
+			"round-trip preserves all entries",
+		);
+		for (key, value) in &def.env {
+			assert_eq!(
+				reloaded.env.get(key).map(Secret::expose),
+				Some(value.expose()),
+			);
+		}
 	}
 
 	/// A full gateway configuration with multiple servers
@@ -320,7 +495,7 @@ mod tests {
 		assert!(config.servers.contains_key("remote-tools"));
 	}
 
-	/// An empty servers map is valid — the gateway starts with
+	/// An empty servers map is valid: the gateway starts with
 	/// no configured servers.
 	#[test]
 	fn empty_config_is_valid() {
@@ -338,7 +513,7 @@ mod tests {
 	}
 
 	/// A stdio definition without a command is a deserialisation
-	/// error — command is required for stdio transport.
+	/// error: command is required for stdio transport.
 	#[test]
 	fn stdio_without_command_fails() {
 		let json = r#"{"transport": "stdio"}"#;
@@ -347,7 +522,7 @@ mod tests {
 	}
 
 	/// An HTTP definition without a URL is a deserialisation
-	/// error — url is required for HTTP transport.
+	/// error: url is required for HTTP transport.
 	#[test]
 	fn http_without_url_fails() {
 		let json = r#"{"transport": "http"}"#;
@@ -363,7 +538,7 @@ mod tests {
 		assert!(result.is_err());
 	}
 
-	/// A credential name is optional — servers without credentials
+	/// A credential name is optional; servers without credentials
 	/// deserialise without one.
 	#[test]
 	fn credential_is_optional() {
@@ -455,5 +630,82 @@ mod tests {
 		let headers = ClientIdentityHeaders::default();
 		assert_eq!(headers.certificate, "Client-Cert");
 		assert_eq!(headers.certificate_chain, "Client-Cert-Chain");
+	}
+
+	/// An OAuth credential definition deserialises with all
+	/// supported fields populated.
+	#[test]
+	fn oauth_credential_deserialises_full() {
+		let json = r#"{
+			"oauth": {
+				"github-app": {
+					"token_endpoint": "https://github.com/login/oauth/access_token",
+					"client_id": "client-abc",
+					"client_secret_credential": "github-app-secret",
+					"scope": "repo",
+					"audience": "github",
+					"refresh_skew": "30s"
+				}
+			}
+		}"#;
+		let config: GatewayConfig = serde_json::from_str(json).unwrap();
+		let entry = config.oauth.get("github-app").expect("entry present");
+		assert_eq!(
+			entry.token_endpoint,
+			"https://github.com/login/oauth/access_token"
+		);
+		assert_eq!(entry.client_id, "client-abc");
+		assert_eq!(entry.client_secret_credential, "github-app-secret");
+		assert_eq!(entry.scope.as_deref(), Some("repo"));
+		assert_eq!(entry.audience.as_deref(), Some("github"));
+		assert_eq!(entry.refresh_skew.as_deref(), Some("30s"));
+	}
+
+	/// An OAuth credential definition with only the required
+	/// fields parses, leaving the optional ones as `None`.
+	#[test]
+	fn oauth_credential_deserialises_minimal() {
+		let json = r#"{
+			"oauth": {
+				"slim": {
+					"token_endpoint": "https://example.com/token",
+					"client_id": "id",
+					"client_secret_credential": "secret-name"
+				}
+			}
+		}"#;
+		let config: GatewayConfig = serde_json::from_str(json).unwrap();
+		let entry = config.oauth.get("slim").expect("entry present");
+		assert_eq!(entry.scope, None);
+		assert_eq!(entry.audience, None);
+		assert_eq!(entry.refresh_skew, None);
+	}
+
+	/// A configuration without an `oauth` map deserialises with
+	/// the field defaulting to an empty map. Existing operators
+	/// who do not use OAuth see no behavioural change.
+	#[test]
+	fn oauth_map_defaults_to_empty() {
+		let json = r#"{"servers": {}}"#;
+		let config: GatewayConfig = serde_json::from_str(json).unwrap();
+		assert!(config.oauth.is_empty());
+	}
+
+	/// OAuth credentials survive a serialisation round-trip: the
+	/// gateway can write a configuration back out (e.g. for
+	/// debugging) without losing OAuth entries.
+	#[test]
+	fn oauth_credentials_round_trip() {
+		let original = OAuthCredential {
+			token_endpoint: "https://example.com/token".to_owned(),
+			client_id: "id".to_owned(),
+			client_secret_credential: "secret".to_owned(),
+			scope: Some("read".to_owned()),
+			audience: None,
+			refresh_skew: Some("1m".to_owned()),
+		};
+		let serialised = serde_json::to_string(&original).unwrap();
+		let restored: OAuthCredential = serde_json::from_str(&serialised).unwrap();
+		assert_eq!(restored, original);
 	}
 }
